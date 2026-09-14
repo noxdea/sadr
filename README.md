@@ -51,6 +51,18 @@ position = Sadr::Protocol.position(my_text_index, byte_offset)
 edits = Sadr::Protocol.text_edits(my_text_index, server_edits)
 ```
 
+Tests can use the bundled child-process server or the in-memory transport:
+
+```ruby
+require "sadr/testing"
+
+client = Sadr::Client.new(command: Sadr::Testing::FakeServer.command)
+server = Sadr::Testing::FakeServer.new(responses: {"custom/request" => {"ok" => true}})
+fast_client = Sadr::Testing::FakeClient.new(server: server)
+```
+
+Set `SADR_INTEGRATION=1` to include the optional `ruby-lsp` integration test.
+
 ## Development
 
 ```sh

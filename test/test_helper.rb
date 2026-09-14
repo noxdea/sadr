@@ -6,9 +6,9 @@ require "minitest/autorun"
 require "rbconfig"
 require "stringio"
 require "sadr"
+require "sadr/testing"
 
 require_relative "support/text_index"
-require_relative "support/fake_server"
 
 module SadrTestHelpers
   def wait_until(timeout: 3)

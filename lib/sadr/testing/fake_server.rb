@@ -1,8 +1,15 @@
 # frozen_string_literal: true
 
+require "rbconfig"
+
 module Sadr
   module Testing
     class FakeServer
+      DEFAULT_CAPABILITIES = {
+        "positionEncoding" => "utf-16",
+        "textDocumentSync" => {"openClose" => true, "change" => 2, "save" => {"includeText" => true}}
+      }.freeze
+
       SCRIPT = <<~'RUBY'
         require "json"
         STDIN.binmode
@@ -131,6 +138,34 @@ module Sadr
       RUBY
 
       def self.command = [RbConfig.ruby, "-e", SCRIPT]
+
+      attr_reader :capabilities, :messages
+
+      def initialize(responses: {}, capabilities: DEFAULT_CAPABILITIES)
+        raise ArgumentError, "responses must be a Hash" unless responses.is_a?(Hash)
+        raise ArgumentError, "capabilities must be a Hash" unless capabilities.is_a?(Hash)
+
+        @responses = responses.transform_keys(&:to_s)
+        @capabilities = capabilities
+        @messages = []
+        @lock = Mutex.new
+      end
+
+      def transport(&receive) = FakeTransport.new(self, &receive)
+
+      def dispatch(message)
+        @lock.synchronize { @messages << message }
+        return [] unless message.key?("id") && message.key?("method")
+
+        result = case message["method"]
+        when "initialize" then {"capabilities" => @capabilities}
+        when "shutdown" then nil
+        else
+          response = @responses.fetch(message["method"], message["params"])
+          response.respond_to?(:call) ? response.call(message["params"], message) : response
+        end
+        [{"jsonrpc" => "2.0", "id" => message["id"], "result" => result}]
+      end
     end
   end
 end
