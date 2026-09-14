@@ -370,6 +370,90 @@ class ClientTest < Minitest::Test
     client&.stop
   end
 
+  def test_stop_reaps_a_restart_interrupted_between_spawn_and_tracking
+    entered = Queue.new
+    release = Queue.new
+    existing_threads = Thread.list
+    client = Sadr::Client.new(command: Sadr::Testing::FakeServer.command, restart: true)
+    client.start(timeout: 3)
+    source, first_line = Sadr::Transport.instance_method(:initialize).source_location
+    lines = File.readlines(source)
+    target_line = ((first_line - 1)...lines.length).find { |index| lines[index].include?("@pid = @process.pid") } + 1
+    transport = nil
+    trace = TracePoint.new(:line) do |event|
+      next unless event.path == source && event.lineno == target_line
+
+      transport = event.self
+      entered << true
+      release.pop
+    end
+    trace.enable
+
+    assert_raises(Sadr::Error) { client.request("crash").await }
+    wait_until { !entered.empty? }
+    entered.pop
+    restart = client.instance_variable_get(:@restart_thread)
+    process = transport.instance_variable_get(:@process)
+
+    client.stop
+    assert restart.join(3), "interrupted restart thread remained alive"
+    refute process.alive?
+    wait_until { (Thread.list - existing_threads).empty? }
+  ensure
+    trace&.disable
+    release << true if release
+    transport&.close
+    client&.stop
+  end
+
+  def test_an_older_overlapping_stop_cannot_clobber_a_new_lifecycle
+    entered = Queue.new
+    release = Queue.new
+    begin_stop = Queue.new
+    client = Sadr::Client.new(command: Sadr::Testing::FakeServer.command, restart: false)
+    client.start(timeout: 3)
+    source, first_line = Sadr::Client.instance_method(:stop).source_location
+    lines = File.readlines(source)
+    target_line = ((first_line - 1)...lines.length).find { |index| lines[index].include?("[transport, connecting]") } + 1
+    first_stop = Thread.new do
+      begin_stop.pop
+      client.stop
+    end
+    trace = TracePoint.new(:line) do |event|
+      next unless Thread.current == first_stop && event.path == source && event.lineno == target_line
+
+      entered << true
+      release.pop
+    end
+    trace.enable
+    begin_stop << true
+    wait_until { !entered.empty? }
+    entered.pop
+
+    second_stop = Thread.new { client.stop }
+    assert second_stop.join(3), "second stop remained blocked"
+    client.start(timeout: 3)
+    replacement = client.transport
+    release << true
+    assert first_stop.join(3), "first stop remained blocked"
+    assert client.running?
+    assert_same replacement, client.transport
+    assert probe(client).is_a?(Array)
+
+    client.stop
+    refute replacement.alive?
+  ensure
+    trace&.disable
+    release << true if release
+    [first_stop, second_stop].compact.each do |thread|
+      next if thread.join(1)
+
+      thread.kill
+      thread.join(1)
+    end
+    client&.stop
+  end
+
   def test_stop_prevents_a_queued_restart_from_creating_a_transport
     entered = Queue.new
     release = Queue.new
