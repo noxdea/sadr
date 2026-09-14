@@ -172,6 +172,44 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_deferred_reply_never_moves_to_a_replacement_transport
+    entered = Queue.new
+    release = Queue.new
+    client = Sadr::Client.new(command: Sadr::Testing::FakeServer.command, restart: true)
+    client.start(timeout: 3)
+    deferred = Sadr::Future.new(nil)
+    client.on("deferred") { deferred }
+    client.request("server_request", method: "deferred").await
+    source, first_line = Sadr::Client.instance_method(:reply).source_location
+    lines = File.readlines(source)
+    target_line = ((first_line - 1)...lines.length).find { |index| lines[index].include?("response = {jsonrpc:") } + 1
+    trace = TracePoint.new(:line) do |event|
+      next unless event.path == source && event.lineno == target_line
+
+      entered << true
+      release.pop
+    end
+    trace.enable
+    replying = Thread.new { deferred.fulfill("old") }
+    wait_until { !entered.empty? }
+    entered.pop
+    old_pid = client.transport.pid
+
+    assert_raises(Sadr::Error) { client.request("crash").await }
+    wait_until { client.running? && client.transport.pid != old_pid }
+    release << true
+    assert replying.join(3), "deferred reply remained blocked"
+    refute probe(client).any? { |message| message["id"] == "server-1" }
+  ensure
+    trace&.disable
+    release << true if release
+    if replying && !replying.join(1)
+      replying.kill
+      replying.join(1)
+    end
+    client&.stop
+  end
+
   def test_crash_restarts_and_reopens_documents_once
     with_client(restart: true) do |client|
       uri = client.open(document)
@@ -184,6 +222,41 @@ class ClientTest < Minitest::Test
       client.change(uri, 1, [Sadr::ContentChange.new(range: nil, text: "new")])
       assert_equal 1, probe(client).count { |message| message["method"] == "textDocument/didChange" }
     end
+  end
+
+  def test_public_messages_are_rejected_while_starting
+    entered = Queue.new
+    release = Queue.new
+    klass = Class.new(Sadr::Client) do
+      define_method(:build_transport) do |epoch|
+        value = super(epoch)
+        if state == :starting
+          entered << true
+          release.pop
+        end
+        value
+      end
+    end
+    client = klass.new(command: Sadr::Testing::FakeServer.command, restart: false)
+    starter = Thread.new { client.start(timeout: 3) }
+    wait_until { !entered.empty? }
+    entered.pop
+    refute client.running?
+    assert_raises(Sadr::Error) { client.request("during_start").await }
+    assert_raises(Sadr::Error) { client.notify("during_start") }
+    assert_raises(Sadr::Error) { client.hover(document.uri, POSITION).await }
+
+    release << true
+    assert starter.join(3), "start remained blocked"
+    starter.value
+    refute probe(client).any? { |message| message["method"] == "during_start" || message["method"] == "textDocument/hover" }
+  ensure
+    release << true if release
+    if starter && !starter.join(1)
+      starter.kill
+      starter.join(1)
+    end
+    client&.stop
   end
 
   def test_running_stays_false_until_restart_reopens_every_document
@@ -200,7 +273,7 @@ class ClientTest < Minitest::Test
     end
     client = klass.new(command: Sadr::Testing::FakeServer.command, restart: true)
     client.start(timeout: 3)
-    client.open(document)
+    uri = client.open(document)
 
     2.times do
       assert_raises(Sadr::Error) { client.request("crash").await }
@@ -208,9 +281,14 @@ class ClientTest < Minitest::Test
       entered.pop
       assert_equal :restarting, client.state
       refute client.running?
+      assert_raises(Sadr::Error) { client.request("during_restart").await }
+      assert_raises(Sadr::Error) { client.notify("during_restart") }
+      assert_raises(Sadr::Error) { client.hover(uri, POSITION).await }
       release << true
       wait_until { client.running? }
-      assert_equal 1, client.request("probe").await.count { |message| message["method"] == "textDocument/didOpen" }
+      messages = client.request("probe").await
+      assert_equal 1, messages.count { |message| message["method"] == "textDocument/didOpen" }
+      refute messages.any? { |message| message["method"] == "during_restart" || message["method"] == "textDocument/hover" }
     end
   ensure
     release << true if release
@@ -219,13 +297,12 @@ class ClientTest < Minitest::Test
 
   def test_stop_cancels_a_restart_even_after_its_transport_is_created
     entered = Queue.new
-    release = Queue.new
     klass = Class.new(Sadr::Client) do
       define_method(:build_transport) do |epoch|
         value = super(epoch)
         if state == :restarting
           entered << value
-          release.pop
+          sleep(0.005) while value.alive?
         end
         value
       end
@@ -235,16 +312,14 @@ class ClientTest < Minitest::Test
     assert_raises(Sadr::Error) { client.request("crash").await }
     wait_until { !entered.empty? }
     restarted_transport = entered.pop
+    restart = client.instance_variable_get(:@restart_thread)
 
     client.stop
-    release << true
-    restart = client.instance_variable_get(:@restart_thread)
     assert restart.join(3), "restart did not observe cancellation"
     assert_equal :stopped, client.state
     refute client.running?
     refute restarted_transport.alive?
   ensure
-    release << true if release
     client&.stop
   end
 
@@ -270,16 +345,47 @@ class ClientTest < Minitest::Test
     assert_raises(Sadr::Error) { client.request("crash").await }
     wait_until { !entered.empty? }
     entered.pop
+    restart = client.instance_variable_get(:@restart_thread)
 
     client.stop
     release << true
-    restart = client.instance_variable_get(:@restart_thread)
     assert restart.join(3), "restart did not observe cancellation"
     assert built.empty?
     assert_equal :stopped, client.state
     refute client.running?
   ensure
     release << true if release
+    client&.stop
+  end
+
+  def test_restart_is_not_lost_when_the_new_transport_fails_before_the_loop_exits
+    client = Sadr::Client.new(command: Sadr::Testing::FakeServer.command, restart: true)
+    client.start(timeout: 3)
+    source, first_line = Sadr::Client.instance_method(:restart_loop).source_location
+    lines = File.readlines(source)
+    running_line = ((first_line - 1)...lines.length).find { |index| lines[index].include?("@state = :running") } + 1
+    target_line = running_line + 3
+    killed = Queue.new
+    fired = false
+    trace = TracePoint.new(:line) do |event|
+      next unless !fired && event.path == source && event.lineno == target_line
+
+      fired = true
+      pid = client.transport.pid
+      Process.kill("KILL", pid)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+      sleep(0.005) until client.state == :failed || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      killed << [pid, client.state]
+    end
+    trace.enable
+
+    assert_raises(Sadr::Error) { client.request("crash").await }
+    wait_until { !killed.empty? }
+    pid, state = killed.pop
+    assert_equal :failed, state
+    wait_until { client.running? && client.transport.pid != pid }
+  ensure
+    trace&.disable
     client&.stop
   end
 
@@ -341,6 +447,27 @@ class ClientTest < Minitest::Test
       assert stopping.join(3), "stop remained blocked behind a document write"
       assert change.join(3), "document write did not unblock after transport close"
       refute writer.closed.empty?
+    end
+  end
+
+  def test_stopping_closes_the_transport_while_a_request_write_is_blocked
+    with_client do |client|
+      transport = client.transport
+      writer = BlockingWriter.new(transport.instance_variable_get(:@stdin))
+      transport.instance_variable_set(:@stdin, writer)
+      existing_threads = Thread.list
+      request = Thread.new do
+        client.request("probe").await
+      rescue Sadr::Error
+        nil
+      end
+      wait_until { !writer.entered.empty? }
+
+      stopping = Thread.new { client.stop }
+      assert stopping.join(4), "stop remained blocked behind a request write"
+      assert request.join(3), "request write did not unblock after transport close"
+      refute writer.closed.empty?
+      wait_until { (Thread.list - existing_threads).empty? }
     end
   end
 
