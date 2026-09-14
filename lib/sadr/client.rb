@@ -90,7 +90,9 @@ module Sadr
       ensure
         [transport, connecting].compact.uniq.each(&:close)
         [shutdown, restart_thread].compact.uniq.each { |thread| finish_thread(thread) }
-        @lock.synchronize do
+        pending = @lock.synchronize do
+          next unless @epoch == stop_epoch && @transport.equal?(transport)
+
           @epoch += 1
           @documents.clear
           @semantic.clear
@@ -100,8 +102,12 @@ module Sadr
           @connecting_transport = nil
           @restart_thread = nil
           @state = :stopped
+          values = @pending.values
+          @pending.clear
+          values
         end
-        fail_pending(Error.new("language server stopped"))
+        error = Error.new("language server stopped")
+        pending&.each { |future, _| future.fulfill(error: error) }
       end
     end
 

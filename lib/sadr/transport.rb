@@ -21,9 +21,10 @@ module Sadr
       @reader = @logger = nil
       @write_lock = Mutex.new
       @stderr_lines = []
-      @stdin, @stdout, @stderr, @process = Open3.popen3(env, *command, **options)
-      @pid = @process.pid
+      initialized = false
       begin
+        @stdin, @stdout, @stderr, @process = Open3.popen3(env, *command, **options)
+        @pid = @process.pid
         on_spawn&.call(self)
         @close_lock.synchronize do
           raise Error, "language server connection was cancelled" if @closing
@@ -33,9 +34,9 @@ module Sadr
           @reader = Thread.new { read(receive) }
           @logger = Thread.new { read_stderr }
         end
-      rescue StandardError
-        close
-        raise
+        initialized = true
+      ensure
+        close if @process && !initialized
       end
     end
 
@@ -143,15 +144,16 @@ module Sadr
       return unless closing
 
       @stdin.close unless @stdin.closed?
+      pid = @pid || @process.pid
       unless @process.join(1)
         begin
-          Process.kill("TERM", @pid)
+          Process.kill("TERM", pid)
         rescue Errno::ESRCH
           nil
         end
         unless @process.join(1)
           begin
-            Process.kill("KILL", @pid)
+            Process.kill("KILL", pid)
           rescue Errno::ESRCH
             nil
           end
