@@ -71,7 +71,7 @@ class ProtocolTest < Minitest::Test
     assert_equal [0, 1], tokens.map(&:line)
     assert tokens.all? { |token| token.is_a?(Sadr::Token) }
 
-    [[0, 0, 0, 0, 0], [0, 0, 1, -1, 0], [0, 0, 1, 0, 1 << 31], [1]].each do |invalid|
+    [[0, 0, 0, 0, 0], [0, 0, 1, -1, 0], [0, 0, 1, 0, 1 << 31], [0, 0, 1.0, 0, 0], [1]].each do |invalid|
       assert_raises(Sadr::Error) { Sadr::Protocol.semantic_tokens(invalid) }
     end
     assert_raises(Sadr::Error) { Sadr::Protocol.semantic_tokens([0, 0, 1, 2, 0], legend: {"tokenTypes" => ["type"], "tokenModifiers" => []}) }
