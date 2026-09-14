@@ -58,7 +58,7 @@ module Sadr
       Subscription.new { @lock.synchronize { @callbacks.delete(callback) } }
     end
 
-    def await(timeout: 10)
+    def await(timeout: nil)
       valid = timeout.nil? || (timeout.is_a?(Numeric) && timeout.finite? && timeout >= 0)
       raise ArgumentError, "timeout must be finite and nonnegative" unless valid
 

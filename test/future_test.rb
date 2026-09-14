@@ -58,6 +58,12 @@ class FutureTest < Minitest::Test
 
     executor = executor_class.new
     executor_class.current = executor
+    unbounded = Sadr::Future.new(2)
+    fiber = Fiber.new { unbounded.await }
+    assert_equal [unbounded, nil], fiber.resume
+    unbounded.fulfill(:unbounded)
+    assert_equal :unbounded, fiber.resume(:unbounded)
+
     future = Sadr::Future.new(3)
     events = []
     fiber = Fiber.new { events << :waiting; events << future.await(timeout: 1) }

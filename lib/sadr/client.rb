@@ -42,11 +42,11 @@ module Sadr
       @documents = {}
       @diagnostics = {}
       @semantic = {}
+      @semantic_requests = Hash.new(0)
       @sequence = 0
       @lock = Mutex.new
       @document_lock = Mutex.new
       @connecting_transport = nil
-      @connect_thread = nil
       @state = :stopped
       @restarts = 0
       @epoch = 0
@@ -66,9 +66,9 @@ module Sadr
     end
 
     def stop
-      running, transport, stop_epoch, connecting, restart_thread, connect_thread = @lock.synchronize do
+      running, transport, stop_epoch, connecting, restart_thread = @lock.synchronize do
         @closing = true
-        [@state == :running, @transport, @epoch, @connecting_transport, @restart_thread, @connect_thread]
+        [@state == :running, @transport, @epoch, @connecting_transport, @restart_thread]
       end
       shutdown = nil
       begin
@@ -89,15 +89,15 @@ module Sadr
         shutdown&.join(2)
       ensure
         [transport, connecting].compact.uniq.each(&:close)
-        [shutdown, restart_thread, connect_thread].compact.uniq.each { |thread| finish_thread(thread) }
+        [shutdown, restart_thread].compact.uniq.each { |thread| finish_thread(thread) }
         @lock.synchronize do
           @epoch += 1
           @documents.clear
           @semantic.clear
+          @semantic_requests.clear
           @semantic_generation += 1
           @diagnostics.clear
           @connecting_transport = nil
-          @connect_thread = nil
           @restart_thread = nil
           @state = :stopped
         end
@@ -127,9 +127,9 @@ module Sadr
     def supports?(capability) = !!@capabilities[capability.to_s]
 
     def open(document)
-      validate_document(document)
-      stored = Document.new(uri: document.uri.dup.freeze, language_id: document.language_id.dup.freeze,
-        version: document.version, text: document.text.dup.freeze)
+      uri, language_id, text = validate_document(document)
+      stored = Document.new(uri: uri.freeze, language_id: language_id.freeze,
+        version: document.version, text: text.freeze)
       @document_lock.synchronize do
         send_open = @lock.synchronize do
           ensure_running!
@@ -144,6 +144,7 @@ module Sadr
     end
 
     def change(uri, version, changes)
+      uri = valid_uri(uri)
       @document_lock.synchronize do
         updated, notification = @lock.synchronize do
           ensure_running!
@@ -155,18 +156,18 @@ module Sadr
 
           text = document.text
           wire_changes = changes.map do |change|
-            validate_change(change)
+            change_text = validate_change(change)
             if change.range
               index = DocumentIndex.new(text)
               first = Protocol.offset(index, change.range.start)
               last = Protocol.offset(index, change.range.end)
               raise Error, "invalid content change range" if last < first
 
-              text = text.byteslice(0, first) + change.text + text.byteslice(last, text.bytesize - last)
-              {range: Protocol.range_hash(change.range), text: change.text}
+              text = text.byteslice(0, first) + change_text + text.byteslice(last, text.bytesize - last)
+              {range: Protocol.range_hash(change.range), text: change_text}
             else
-              text = change.text
-              {text: change.text}
+              text = change_text
+              {text: change_text}
             end
           end
           updated = Document.new(uri: document.uri, language_id: document.language_id, version: version, text: text.freeze)
@@ -187,6 +188,8 @@ module Sadr
     end
 
     def save(uri, text: nil)
+      uri = valid_uri(uri)
+      text = utf8_string(text, "saved text must be valid UTF-8") unless text.nil?
       @document_lock.synchronize do
         params = @lock.synchronize do
           ensure_running!
@@ -195,9 +198,6 @@ module Sadr
           save = sync.is_a?(Hash) ? sync["save"] : sync.is_a?(Integer) && sync.positive?
           next unless save
 
-          if text
-            raise Error, "saved text must be valid UTF-8" unless text.is_a?(String) && text.valid_encoding?
-          end
           value = {textDocument: {uri: uri}}
           value[:text] = text || document.text if save.is_a?(Hash) && save["includeText"]
           value
@@ -209,6 +209,7 @@ module Sadr
     end
 
     def close(uri)
+      uri = valid_uri(uri)
       @document_lock.synchronize do
         send_close = @lock.synchronize do
           ensure_running!
@@ -233,7 +234,7 @@ module Sadr
     end
 
     def rename(uri, position, new_name)
-      raise Error, "new name must be a String" unless new_name.is_a?(String) && new_name.valid_encoding?
+      new_name = utf8_string(new_name, "new name must be a valid UTF-8 String")
 
       request_at("rename", uri, position, newName: new_name)
     end
@@ -258,7 +259,7 @@ module Sadr
     def diagnostic(uri, previous_result_id: nil)
       params = {}
       if previous_result_id
-        raise Error, "previous result id must be a String" unless previous_result_id.is_a?(String)
+        previous_result_id = utf8_string(previous_result_id, "previous result id must be a valid UTF-8 String")
 
         params[:previousResultId] = previous_result_id
       end
@@ -266,13 +267,13 @@ module Sadr
     end
 
     def semantic_tokens(uri, version:)
-      document, provider, previous, generation = @lock.synchronize do
+      document, provider, previous, generation, request_sequence = @lock.synchronize do
         document = @documents[uri]
         provider = @capabilities["semanticTokensProvider"]
-        [document, provider, @semantic[uri], @semantic_generation]
+        request_sequence = @semantic_requests[uri] += 1 if document&.version == version && provider.is_a?(Hash) && provider["full"]
+        [document, provider, @semantic[uri], @semantic_generation, request_sequence]
       end
-      return [] unless document && document.version == version
-      return [] unless provider.is_a?(Hash) && provider["full"]
+      return [] unless request_sequence
 
       delta = previous && previous[0] && provider["full"].is_a?(Hash) && provider["full"]["delta"]
       method = delta ? "textDocument/semanticTokens/full/delta" : "textDocument/semanticTokens/full"
@@ -282,7 +283,9 @@ module Sadr
 
       @lock.synchronize do
         current = @documents[uri]
-        return [] unless result && current.equal?(document) && current.version == version && generation == @semantic_generation
+        current_request = @semantic_requests[uri]
+        return [] unless result && current.equal?(document) && current.version == version &&
+          generation == @semantic_generation && request_sequence == current_request
 
         raise Error, "unexpected semantic token delta" if !delta && !result.key?("data")
 
@@ -294,7 +297,7 @@ module Sadr
     end
 
     def workspace_symbols(query)
-      raise Error, "query must be a String" unless query.is_a?(String)
+      query = utf8_string(query, "query must be a valid UTF-8 String")
 
       checked_request("workspace/symbol", {query: query}, :workspace_symbols)
     end
@@ -304,7 +307,8 @@ module Sadr
     def resolve_code_lens(lens) = resolve("codeLens/resolve", lens, :code_lens)
 
     def execute_command(command, arguments: [])
-      raise Error, "command must be a nonempty String" unless command.is_a?(String) && !command.empty?
+      command = utf8_string(command, "command must be a nonempty valid UTF-8 String")
+      raise Error, "command must be a nonempty valid UTF-8 String" if command.empty?
       raise Error, "arguments must be an Array" unless arguments.is_a?(Array)
 
       request("workspace/executeCommand", {command: command, arguments: arguments})
@@ -372,8 +376,8 @@ module Sadr
         @state = state
         @epoch += 1
         @semantic.clear
+        @semantic_requests.clear
         @semantic_generation += 1
-        @connect_thread = Thread.current
         @epoch
       end
       transport = build_transport(epoch)
@@ -410,24 +414,24 @@ module Sadr
     ensure
       @lock.synchronize do
         @connecting_transport = nil if @connecting_transport.equal?(transport)
-        @connect_thread = nil if @connect_thread == Thread.current
       end
     end
 
     def build_transport(epoch)
-      transport = Transport.new(@command, cwd: @root, env: @env) do |message, error|
+      Transport.new(@command, cwd: @root, env: @env, on_spawn: ->(transport) {
+        tracked = @lock.synchronize do
+          next false unless @epoch == epoch && !@closing && %i[starting restarting].include?(@state)
+
+          @connecting_transport = transport
+          true
+        end
+        unless tracked
+          transport.close
+          raise Error, "language server connection was cancelled"
+        end
+      }) do |message, error|
         receive(message, error, epoch)
       end
-      tracked = @lock.synchronize do
-        next false unless @epoch == epoch && !@closing && %i[starting restarting].include?(@state)
-
-        @connecting_transport = transport
-        true
-      end
-      return transport if tracked
-
-      transport.close
-      raise Error, "language server connection was cancelled"
     end
 
     def fulfill_response(entry, message)
@@ -730,14 +734,12 @@ module Sadr
 
     def validate_document(document)
       raise Error, "expected a Document" unless document.is_a?(Document)
-      valid_uri(document.uri)
-      unless document.language_id.is_a?(String) && !document.language_id.empty?
-        raise Error, "language id must be a nonempty String"
-      end
+      uri = valid_uri(document.uri)
+      language_id = utf8_string(document.language_id, "language id must be a nonempty valid UTF-8 String")
+      raise Error, "language id must be a nonempty valid UTF-8 String" if language_id.empty?
       raise Error, "document version must be an unsigned integer" unless Protocol.uint?(document.version)
-      unless document.text.is_a?(String) && document.text.valid_encoding?
-        raise Error, "document text must be valid UTF-8"
-      end
+      text = utf8_string(document.text, "document text must be valid UTF-8")
+      [uri, language_id, text]
     end
 
     def ensure_running!
@@ -746,19 +748,29 @@ module Sadr
 
     def validate_change(change)
       raise Error, "expected a ContentChange" unless change.is_a?(ContentChange)
-      raise Error, "change text must be valid UTF-8" unless change.text.is_a?(String) && change.text.valid_encoding?
 
       Protocol.range_value(change.range) if change.range
+      utf8_string(change.text, "change text must be valid UTF-8")
     end
 
     def valid_uri(uri)
-      valid = uri.is_a?(String) && !uri.empty? && !uri.include?("\0") && uri.valid_encoding?
+      uri = utf8_string(uri, "invalid URI")
+      valid = !uri.empty? && !uri.include?("\0")
       parsed = URI::DEFAULT_PARSER.parse(uri) if valid
       raise Error, "invalid URI" unless valid && parsed&.scheme && !parsed.scheme.empty?
 
       uri
     rescue URI::InvalidURIError
       raise Error, "invalid URI"
+    end
+
+    def utf8_string(value, message)
+      raise Error, message unless value.is_a?(String)
+
+      value = value.dup.force_encoding(Encoding::UTF_8)
+      raise Error, message unless value.valid_encoding?
+
+      value
     end
 
     def request_at(method, uri, position, params = {})
@@ -792,8 +804,11 @@ module Sadr
     end
 
     def cancel(id, transport, epoch)
-      @lock.synchronize { @pending.delete(id) }
-      send_notification("$/cancelRequest", {id: id}, state: nil, epoch: epoch, transport: transport)
+      target = @lock.synchronize do
+        @pending.delete(id)
+        connected_transport(state: nil, epoch: epoch, transport: transport, allow_closing: false)
+      end
+      target&.try_write(jsonrpc: "2.0", method: "$/cancelRequest", params: {id: id})
     rescue Error
       nil
     end
@@ -828,7 +843,7 @@ module Sadr
       return unless @lock.synchronize { epoch == @epoch }
 
       if error
-        receive_error(error)
+        receive_error(error, epoch)
       elsif message.key?("id") && !message.key?("method")
         entry = @lock.synchronize { @pending.delete(message["id"]) }
         fulfill_response(entry, message)
@@ -842,13 +857,19 @@ module Sadr
       end
     end
 
-    def receive_error(error)
-      restart_epoch = @lock.synchronize do
+    def receive_error(error, epoch)
+      pending, restart_epoch = @lock.synchronize do
+        next unless epoch == @epoch
+
         running = @state == :running && !@closing
         @state = :failed unless @closing
-        @epoch if running && @restart && @restarts < 3
+        values = @pending.values
+        @pending.clear
+        [values, (@epoch if running && @restart && @restarts < 3)]
       end
-      fail_pending(Error.new(error.message))
+      return unless pending
+
+      pending.each { |future, _| future.fulfill(error: Error.new(error.message)) }
       report_error(error)
       restart_server(restart_epoch) if restart_epoch
     end

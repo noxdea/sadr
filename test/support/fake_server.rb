@@ -18,6 +18,7 @@ module Sadr
         command = {title: "Run", command: "run", arguments: []}
         messages = []
         semantic_refreshed = false
+        pending_semantic = nil
         loop do
           headers = {}
           while (line = STDIN.gets) && line != "\r\n"
@@ -51,6 +52,17 @@ module Sadr
           when "crash"
             exit!(1)
           when "textDocument/semanticTokens/full"
+            if ENV["SADR_SEMANTIC_REVERSE"]
+              unless pending_semantic
+                pending_semantic = message
+                send_message(jsonrpc: "2.0", method: "semantic_started", params: {})
+                next
+              end
+              send_message(jsonrpc: "2.0", id: message["id"], result: {resultId: "new", data: [0, 0, 2, 0, 0]})
+              send_message(jsonrpc: "2.0", id: pending_semantic["id"], result: {resultId: "old", data: [0, 0, 1, 0, 0]})
+              pending_semantic = nil
+              next
+            end
             if ENV["SADR_SEMANTIC_REFRESH"] && !semantic_refreshed
               semantic_refreshed = true
               send_message(jsonrpc: "2.0", id: "semantic-refresh", method: "workspace/semanticTokens/refresh", params: {})
