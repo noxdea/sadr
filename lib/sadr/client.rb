@@ -45,6 +45,8 @@ module Sadr
       @sequence = 0
       @lock = Mutex.new
       @document_lock = Mutex.new
+      @connecting_transport = nil
+      @connect_thread = nil
       @state = :stopped
       @restarts = 0
       @epoch = 0
@@ -64,27 +66,41 @@ module Sadr
     end
 
     def stop
-      running = @lock.synchronize do
+      running, transport, stop_epoch, connecting, restart_thread, connect_thread = @lock.synchronize do
         @closing = true
-        @state == :running
+        [@state == :running, @transport, @epoch, @connecting_transport, @restart_thread, @connect_thread]
       end
-      graceful = running && @document_lock.try_lock
+      shutdown = nil
       begin
-        request("shutdown").await(timeout: 2) if graceful
-        notify("exit") if graceful && @transport&.alive?
-      rescue Error
-        nil
+        shutdown = Thread.new do
+          locked = false
+          begin
+            locked = @document_lock.try_lock
+            next unless locked
+
+            send_request("shutdown", {}, nil, state: :running, epoch: stop_epoch, transport: transport, allow_closing: true).await(timeout: 2)
+            send_notification("exit", {}, state: :running, epoch: stop_epoch, transport: transport, allow_closing: true) if transport&.alive?
+          rescue Error
+            nil
+          ensure
+            @document_lock.unlock if locked
+          end
+        end if running
+        shutdown&.join(2)
       ensure
-        @document_lock.unlock if graceful
+        [transport, connecting].compact.uniq.each(&:close)
+        [shutdown, restart_thread, connect_thread].compact.uniq.each { |thread| finish_thread(thread) }
         @lock.synchronize do
           @epoch += 1
           @documents.clear
           @semantic.clear
           @semantic_generation += 1
           @diagnostics.clear
+          @connecting_transport = nil
+          @connect_thread = nil
+          @restart_thread = nil
           @state = :stopped
         end
-        @transport&.close
         fail_pending(Error.new("language server stopped"))
       end
     end
@@ -99,9 +115,7 @@ module Sadr
     end
 
     def notify(method, params = {})
-      raise Error, "language server is not connected" unless @transport&.alive?
-
-      @transport.write(jsonrpc: "2.0", method: method.to_s, params: params)
+      send_notification(method, params)
     end
 
     def on(method, &handler)
@@ -298,13 +312,25 @@ module Sadr
 
     private
 
-    def send_request(method, params, validator)
-      id = @lock.synchronize { @sequence += 1 }
-      future = Future.new(id, on_error: method(:report_error)) { |number| cancel(number) }
-      @lock.synchronize { @pending[id] = [future, validator] }
-      raise Error, "language server is not connected" unless @transport&.alive?
+    def finish_thread(thread)
+      return if thread == Thread.current || thread.join(1)
 
-      @transport.write(jsonrpc: "2.0", id: id, method: method.to_s, params: params)
+      thread.kill
+      thread.join(1)
+    end
+
+    def send_request(method, params, validator, state: :running, epoch: nil, transport: nil, allow_closing: false)
+      target = request_epoch = future = id = nil
+      @lock.synchronize do
+        id = @sequence += 1
+        target = connected_transport(state: state, epoch: epoch, transport: transport, allow_closing: allow_closing)
+        request_epoch = @epoch
+        future = Future.new(id, on_error: method(:report_error)) { |number| cancel(number, target, request_epoch) }
+        @pending[id] = [future, validator] if target
+      end
+      raise Error, "language server is not connected" unless target&.alive?
+
+      target.write(jsonrpc: "2.0", id: id, method: method.to_s, params: params)
       future
     rescue StandardError => error
       @lock.synchronize { @pending.delete(id) }
@@ -312,8 +338,26 @@ module Sadr
       future
     end
 
-    def checked_request(method, params, kind)
-      send_request(method, params, ->(value) { validate_response(kind, value) })
+    def checked_request(method, params, kind, **options)
+      send_request(method, params, ->(value) { validate_response(kind, value) }, **options)
+    end
+
+    def send_notification(method, params, state: :running, epoch: nil, transport: nil, allow_closing: false)
+      target = @lock.synchronize do
+        connected_transport(state: state, epoch: epoch, transport: transport, allow_closing: allow_closing)
+      end
+      raise Error, "language server is not connected" unless target&.alive?
+
+      target.write(jsonrpc: "2.0", method: method.to_s, params: params)
+    end
+
+    def connected_transport(state:, epoch:, transport:, allow_closing:)
+      return if state && @state != state
+      return if !allow_closing && @closing
+      return if epoch && @epoch != epoch
+      return if transport && !@transport.equal?(transport)
+
+      @transport
     end
 
     def connect(timeout:, state:, expected_epoch: nil)
@@ -329,6 +373,7 @@ module Sadr
         @epoch += 1
         @semantic.clear
         @semantic_generation += 1
+        @connect_thread = Thread.current
         @epoch
       end
       transport = build_transport(epoch)
@@ -336,11 +381,12 @@ module Sadr
         next false unless @epoch == epoch && @state == state && !@closing
 
         @transport = transport
+        @connecting_transport = nil if @connecting_transport.equal?(transport)
         true
       end
       raise Error, "language server connection was cancelled" unless installed
 
-      result = checked_request("initialize", initialize_params, :initialize).await(timeout: timeout)
+      result = checked_request("initialize", initialize_params, :initialize, state: state, epoch: epoch, transport: transport).await(timeout: timeout)
       @lock.synchronize do
         unless @epoch == epoch && @state == state && !@closing && @transport.equal?(transport)
           raise Error, "language server connection was cancelled"
@@ -349,7 +395,7 @@ module Sadr
         @server_info = result["serverInfo"]
         validate_capabilities
       end
-      notify("initialized", {})
+      send_notification("initialized", {}, state: state, epoch: epoch, transport: transport)
       @capabilities
     rescue StandardError => error
       transport&.close
@@ -361,12 +407,27 @@ module Sadr
       end
       fail_pending(error) if active
       raise
+    ensure
+      @lock.synchronize do
+        @connecting_transport = nil if @connecting_transport.equal?(transport)
+        @connect_thread = nil if @connect_thread == Thread.current
+      end
     end
 
     def build_transport(epoch)
-      Transport.new(@command, cwd: @root, env: @env) do |message, error|
+      transport = Transport.new(@command, cwd: @root, env: @env) do |message, error|
         receive(message, error, epoch)
       end
+      tracked = @lock.synchronize do
+        next false unless @epoch == epoch && !@closing && %i[starting restarting].include?(@state)
+
+        @connecting_transport = transport
+        true
+      end
+      return transport if tracked
+
+      transport.close
+      raise Error, "language server connection was cancelled"
     end
 
     def fulfill_response(entry, message)
@@ -716,7 +777,8 @@ module Sadr
     end
 
     def notify_open(document)
-      notify("textDocument/didOpen", {textDocument: {uri: document.uri, languageId: document.language_id, version: document.version, text: document.text}})
+      state, epoch, transport = @lock.synchronize { [@state, @epoch, @transport] }
+      send_notification("textDocument/didOpen", {textDocument: {uri: document.uri, languageId: document.language_id, version: document.version, text: document.text}}, state: state, epoch: epoch, transport: transport)
     end
 
     def sync_mode
@@ -729,9 +791,9 @@ module Sadr
       sync.is_a?(Hash) ? sync["openClose"] : sync.is_a?(Integer) && sync.positive?
     end
 
-    def cancel(id)
+    def cancel(id, transport, epoch)
       @lock.synchronize { @pending.delete(id) }
-      notify("$/cancelRequest", {id: id})
+      send_notification("$/cancelRequest", {id: id}, state: nil, epoch: epoch, transport: transport)
     rescue Error
       nil
     end
@@ -877,11 +939,14 @@ module Sadr
     end
 
     def reply(id, epoch, value: nil, error: nil)
-      return unless epoch == @epoch && !@closing
+      transport = @lock.synchronize do
+        connected_transport(state: nil, epoch: epoch, transport: nil, allow_closing: false)
+      end
+      return unless transport
 
       response = {jsonrpc: "2.0", id: id}
       error ? response[:error] = error : response[:result] = value
-      @transport.write(response)
+      transport.write(response)
     rescue StandardError => failure
       report_error(failure)
     end
@@ -924,7 +989,17 @@ module Sadr
               @state = :running
             end
           end
-          break
+          retry_epoch = @lock.synchronize do
+            if @state == :failed && !@closing
+              @epoch
+            else
+              @restart_thread = nil if @restart_thread == Thread.current
+              nil
+            end
+          end
+          break unless retry_epoch
+
+          epoch = retry_epoch
         rescue StandardError => failure
           report_error(failure)
           epoch = @lock.synchronize { @epoch if @state == :failed && !@closing }
