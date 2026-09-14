@@ -122,7 +122,7 @@ module Sadr
         raise Error, "invalid semantic token legend" unless valid
       end
 
-      unless data.all? { |value| value.is_a?(Integer) && value.between?(0, 0x7fffffff) }
+      unless data.empty? || (data.all?(Integer) && data.min >= 0 && data.max <= 0x7fffffff)
         raise Error, "invalid semantic token value"
       end
       row = 0
@@ -144,7 +144,7 @@ module Sadr
 
         row += delta_row
         column = delta_row.zero? ? column + delta_column : delta_column
-        raise Error, "semantic token position overflow" unless uint?(row) && uint?(column + length)
+        raise Error, "semantic token position overflow" if row > 0x7fffffff || column + length > 0x7fffffff
 
         tokens[index / 5] = Token.new(line: row, character: column, length: length, type: type, modifiers: modifiers) if collect
         index += 5
