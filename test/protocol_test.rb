@@ -101,7 +101,7 @@ class ProtocolTest < Minitest::Test
     edit = {
       "changes" => {"file:///tmp/a.rb" => [{"range" => range, "newText" => "x", "annotationId" => "a"}]},
       "documentChanges" => [
-        {"textDocument" => {"uri" => "file:///tmp/a.rb", "version" => 2}, "edits" => [{"range" => range, "newText" => "y"}]},
+        {"textDocument" => {"uri" => "file:///tmp/a.rb", "version" => -1}, "edits" => [{"range" => range, "newText" => "y"}]},
         {"kind" => "create", "uri" => "file:///tmp/b.rb", "options" => {"overwrite" => true}},
         {"kind" => "rename", "oldUri" => "file:///tmp/b.rb", "newUri" => "file:///tmp/c.rb"},
         {"kind" => "delete", "uri" => "file:///tmp/c.rb", "extension" => {"kept" => true}}
@@ -115,6 +115,6 @@ class ProtocolTest < Minitest::Test
     assert_raises(Sadr::Error) { Sadr::Protocol.workspace_edit("changes" => {"not a uri" => []}) }
     assert_raises(Sadr::Error) { Sadr::Protocol.workspace_edit("changes" => {"file:///tmp/a" => [{"newText" => "x"}]}) }
     assert_raises(Sadr::Error) { Sadr::Protocol.workspace_edit("documentChanges" => [{"kind" => "copy", "uri" => "file:///tmp/a"}]) }
-    assert_raises(Sadr::Error) { Sadr::Protocol.workspace_edit("documentChanges" => [{"textDocument" => {"uri" => "file:///tmp/a", "version" => -1}, "edits" => []}]) }
+    assert_raises(Sadr::Error) { Sadr::Protocol.workspace_edit("documentChanges" => [{"textDocument" => {"uri" => "file:///tmp/a", "version" => 0x80000000}, "edits" => []}]) }
   end
 end

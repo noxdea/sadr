@@ -12,14 +12,14 @@ module Sadr
     }.freeze
     RESPONSE_KINDS = {
       "completion" => :completion,
-      "hover" => :hash_or_nil,
+      "hover" => :hover,
       "definition" => :locations,
       "typeDefinition" => :locations,
       "implementation" => :locations,
       "references" => :locations,
       "rename" => :workspace_edit,
-      "signatureHelp" => :hash_or_nil,
-      "documentSymbol" => :array_or_nil,
+      "signatureHelp" => :signature_help,
+      "documentSymbol" => :document_symbols,
       "formatting" => :text_edits,
       "codeAction" => :code_actions,
       "codeLens" => :code_lenses,
@@ -282,10 +282,10 @@ module Sadr
     def workspace_symbols(query)
       raise Error, "query must be a String" unless query.is_a?(String)
 
-      checked_request("workspace/symbol", {query: query}, :array_or_nil)
+      checked_request("workspace/symbol", {query: query}, :workspace_symbols)
     end
 
-    def resolve_completion(item) = resolve("completionItem/resolve", item, :hash)
+    def resolve_completion(item) = resolve("completionItem/resolve", item, :completion_item)
     def resolve_code_action(action) = resolve("codeAction/resolve", action, :code_action)
     def resolve_code_lens(lens) = resolve("codeLens/resolve", lens, :code_lens)
 
@@ -316,22 +316,35 @@ module Sadr
       send_request(method, params, ->(value) { validate_response(kind, value) })
     end
 
-    def connect(timeout:, state:)
+    def connect(timeout:, state:, expected_epoch: nil)
+      transport = nil
       epoch = @lock.synchronize do
+        if expected_epoch && (@epoch != expected_epoch || @closing || @state != :failed)
+          raise Error, "language server restart was cancelled"
+        end
         raise Error, "language server is already started" if %i[starting restarting running].include?(@state)
 
-        @closing = false
+        @closing = false if state == :starting
         @state = state
         @epoch += 1
         @semantic.clear
         @semantic_generation += 1
         @epoch
       end
-      @transport = Transport.new(@command, cwd: @root, env: @env) do |message, error|
-        receive(message, error, epoch)
+      transport = build_transport(epoch)
+      installed = @lock.synchronize do
+        next false unless @epoch == epoch && @state == state && !@closing
+
+        @transport = transport
+        true
       end
+      raise Error, "language server connection was cancelled" unless installed
+
       result = checked_request("initialize", initialize_params, :initialize).await(timeout: timeout)
       @lock.synchronize do
+        unless @epoch == epoch && @state == state && !@closing && @transport.equal?(transport)
+          raise Error, "language server connection was cancelled"
+        end
         @capabilities = result["capabilities"]
         @server_info = result["serverInfo"]
         validate_capabilities
@@ -339,10 +352,21 @@ module Sadr
       notify("initialized", {})
       @capabilities
     rescue StandardError => error
-      @transport&.close if epoch
-      fail_pending(error) if epoch
-      @lock.synchronize { @state = :failed if epoch && @epoch == epoch }
+      transport&.close
+      active = @lock.synchronize do
+        next false unless epoch && @epoch == epoch
+
+        @state = :failed unless @closing
+        !@closing
+      end
+      fail_pending(error) if active
       raise
+    end
+
+    def build_transport(epoch)
+      Transport.new(@command, cwd: @root, env: @env) do |message, error|
+        receive(message, error, epoch)
+      end
     end
 
     def fulfill_response(entry, message)
@@ -363,17 +387,20 @@ module Sadr
       case kind
       when :initialize
         valid = value.is_a?(Hash) && value["capabilities"].is_a?(Hash)
-      when :hash
-        valid = value.is_a?(Hash)
-      when :hash_or_nil
-        valid = value.nil? || value.is_a?(Hash)
-      when :array_or_nil
-        valid = value.nil? || value.is_a?(Array)
+      when :hover
+        valid = valid_hover?(value)
+      when :signature_help
+        valid = valid_signature_help?(value)
+      when :document_symbols
+        valid = valid_document_symbols?(value)
+      when :workspace_symbols
+        valid = valid_workspace_symbols?(value)
       when :locations
         valid = value.nil? || valid_locations?(value)
       when :completion
-        items = value.is_a?(Hash) ? value["items"] : value
-        valid = value.nil? || (items.is_a?(Array) && items.all? { |item| valid_completion_item?(item) })
+        valid = valid_completion?(value)
+      when :completion_item
+        valid = valid_completion_item?(value)
       when :workspace_edit
         valid = value.nil?
         Protocol.workspace_edit(value) unless valid
@@ -418,38 +445,145 @@ module Sadr
       raise Error, "invalid LSP response"
     end
 
+    def valid_completion?(value)
+      return true if value.nil?
+
+      items = if value.is_a?(Hash)
+        return false unless boolean?(value["isIncomplete"])
+
+        value["items"]
+      else
+        value
+      end
+      items.is_a?(Array) && items.all? { |item| valid_completion_item?(item) }
+    end
+
     def valid_completion_item?(item)
       item.is_a?(Hash) && item["label"].is_a?(String)
     end
 
-    def valid_locations?(value)
-      locations = value.is_a?(Array) ? value : [value]
-      locations.all? do |location|
-        next false unless location.is_a?(Hash)
+    def valid_hover?(hover)
+      return true if hover.nil?
+      return false unless hover.is_a?(Hash) && hover.key?("contents") && valid_hover_contents?(hover["contents"])
 
-        if location["uri"]
-          valid_uri(location["uri"])
-          Protocol.range_value(location.fetch("range"))
-        elsif location["targetUri"]
-          valid_uri(location["targetUri"])
-          Protocol.range_value(location.fetch("targetRange"))
-          Protocol.range_value(location.fetch("targetSelectionRange"))
-          Protocol.range_value(location["originSelectionRange"]) if location["originSelectionRange"]
-          true
-        else
-          false
-        end
+      Protocol.range_value(hover["range"]) if hover.key?("range")
+      true
+    end
+
+    def valid_hover_contents?(contents)
+      return true if contents.is_a?(String)
+      return contents.all? { |item| valid_marked_string?(item) } if contents.is_a?(Array)
+      return false unless contents.is_a?(Hash)
+
+      if contents.key?("kind")
+        %w[plaintext markdown].include?(contents["kind"]) && contents["value"].is_a?(String)
+      else
+        valid_marked_string?(contents)
       end
     end
 
+    def valid_marked_string?(value)
+      value.is_a?(String) || (value.is_a?(Hash) && value["language"].is_a?(String) && value["value"].is_a?(String))
+    end
+
+    def valid_signature_help?(help)
+      return true if help.nil?
+      return false unless help.is_a?(Hash) && help["signatures"].is_a?(Array)
+      return false unless optional_uint?(help, "activeSignature") && optional_uint?(help, "activeParameter")
+
+      help["signatures"].all? { |signature| valid_signature?(signature) }
+    end
+
+    def valid_signature?(signature)
+      return false unless signature.is_a?(Hash) && signature["label"].is_a?(String)
+      return false unless optional_uint?(signature, "activeParameter")
+      return true unless signature.key?("parameters")
+
+      signature["parameters"].is_a?(Array) && signature["parameters"].all? do |parameter|
+        next false unless parameter.is_a?(Hash)
+
+        label = parameter["label"]
+        label.is_a?(String) || (label.is_a?(Array) && label.length == 2 && label.all? { |offset| Protocol.uint?(offset) } && label[0] <= label[1])
+      end
+    end
+
+    def valid_document_symbols?(value)
+      value.nil? || (value.is_a?(Array) && value.all? do |symbol|
+        symbol.is_a?(Hash) && symbol.key?("location") ? valid_symbol_information?(symbol) : valid_document_symbol?(symbol)
+      end)
+    end
+
+    def valid_document_symbol?(symbol)
+      return false unless valid_symbol?(symbol)
+
+      Protocol.range_value(symbol.fetch("range"))
+      Protocol.range_value(symbol.fetch("selectionRange"))
+      !symbol.key?("children") || (symbol["children"].is_a?(Array) && symbol["children"].all? { |child| valid_document_symbol?(child) })
+    end
+
+    def valid_workspace_symbols?(value)
+      value.nil? || (value.is_a?(Array) && value.all? { |symbol| valid_workspace_symbol?(symbol) })
+    end
+
+    def valid_workspace_symbol?(symbol)
+      return false unless valid_symbol?(symbol) && symbol["location"].is_a?(Hash)
+
+      location = symbol["location"]
+      valid_uri(location.fetch("uri"))
+      Protocol.range_value(location["range"]) if location.key?("range")
+      true
+    end
+
+    def valid_symbol_information?(symbol)
+      valid_symbol?(symbol) && valid_location?(symbol["location"])
+    end
+
+    def valid_symbol?(symbol)
+      symbol.is_a?(Hash) && symbol["name"].is_a?(String) && symbol["kind"].is_a?(Integer) && symbol["kind"].between?(1, 26)
+    end
+
+    def valid_locations?(value)
+      locations = value.is_a?(Array) ? value : [value]
+      locations.all? { |location| valid_location?(location) || valid_location_link?(location) }
+    end
+
+    def valid_location?(location)
+      return false unless location.is_a?(Hash) && location.key?("uri")
+
+      valid_uri(location["uri"])
+      Protocol.range_value(location.fetch("range"))
+      true
+    end
+
+    def valid_location_link?(location)
+      return false unless location.is_a?(Hash) && location.key?("targetUri")
+
+      valid_uri(location["targetUri"])
+      Protocol.range_value(location.fetch("targetRange"))
+      Protocol.range_value(location.fetch("targetSelectionRange"))
+      Protocol.range_value(location["originSelectionRange"]) if location.key?("originSelectionRange")
+      true
+    end
+
     def valid_code_action?(action)
-      action.is_a?(Hash) && action["title"].is_a?(String)
+      return false unless action.is_a?(Hash) && action["title"].is_a?(String)
+      return valid_command?(action) if action["command"].is_a?(String)
+      return false if action.key?("command") && !valid_command?(action["command"])
+
+      Protocol.diagnostics(action["diagnostics"]) if action.key?("diagnostics")
+      true
+    end
+
+    def valid_command?(command)
+      command.is_a?(Hash) && command["title"].is_a?(String) && command["command"].is_a?(String) &&
+        (!command.key?("arguments") || command["arguments"].is_a?(Array))
     end
 
     def validate_code_lens(lens)
       raise Error, "invalid LSP response" unless lens.is_a?(Hash)
 
       Protocol.range_value(lens.fetch("range"))
+      raise Error, "invalid LSP response" if lens.key?("command") && !valid_command?(lens["command"])
     end
 
     def validate_inlay_hint(hint)
@@ -473,6 +607,12 @@ module Sadr
         false
       end
     end
+
+    def optional_uint?(value, key)
+      !value.key?(key) || Protocol.uint?(value[key])
+    end
+
+    def boolean?(value) = value == true || value == false
 
     def validate_text_edits(value)
       raise Error, "invalid LSP response" unless value.is_a?(Array)
@@ -641,21 +781,31 @@ module Sadr
     end
 
     def receive_error(error)
-      running = @lock.synchronize do
-        running = @state == :running
-        @state = :failed
-        running
+      restart_epoch = @lock.synchronize do
+        running = @state == :running && !@closing
+        @state = :failed unless @closing
+        @epoch if running && @restart && @restarts < 3
       end
       fail_pending(Error.new(error.message))
       report_error(error)
-      restart_server if running && @restart && !@closing && @restarts < 3
+      restart_server(restart_epoch) if restart_epoch
     end
 
     def receive_call(message, epoch)
       method = message["method"]
       params = message.fetch("params", {})
+      if method == "workspace/semanticTokens/refresh"
+        active = @lock.synchronize do
+          next false unless epoch == @epoch && !@closing
+
+          @semantic.clear
+          @semantic_generation += 1
+          true
+        end
+        return unless active
+      end
       @dispatch.call do
-        next unless epoch == @epoch && !@closing
+        next unless @lock.synchronize { epoch == @epoch && !@closing }
 
         begin
           receive_diagnostics(params) if method == "textDocument/publishDiagnostics"
@@ -702,12 +852,6 @@ module Sadr
       when "workspace/workspaceFolders"
         [true, [{uri: Protocol.uri(@root), name: File.basename(@root)}]]
       when "window/workDoneProgress/create", "workspace/semanticTokens/refresh", "workspace/inlayHint/refresh", "workspace/codeLens/refresh", "workspace/diagnostic/refresh"
-        if method == "workspace/semanticTokens/refresh"
-          @lock.synchronize do
-            @semantic.clear
-            @semantic_generation += 1
-          end
-        end
         [true, nil]
       else
         [false, nil]
@@ -742,36 +886,49 @@ module Sadr
       report_error(failure)
     end
 
-    def restart_server
-      return if @restart_thread&.alive?
+    def restart_server(epoch)
+      @lock.synchronize do
+        return unless @epoch == epoch && @state == :failed && !@closing
+        return if @restart_thread&.alive?
 
-      previous = @transport
-      @restart_thread = Thread.new do
-        previous.close
-        until @closing || @restarts >= 3
+        previous = @transport
+        @restart_thread = Thread.new { restart_loop(previous, epoch) }
+      end
+    end
+
+    def restart_loop(previous, epoch)
+      previous.close
+      loop do
+        attempt = @lock.synchronize do
+          next if @closing || @state != :failed || @epoch != epoch || @restarts >= 3
+
           @restarts += 1
-          sleep(0.2 * @restarts)
-          break if @closing
+          [@restarts, epoch]
+        end
+        break unless attempt
 
-          begin
-            connect(timeout: 10, state: :restarting)
-            @document_lock.synchronize do
-              documents, send_open, epoch = @lock.synchronize do
-                raise Error, "language server restart was cancelled" if @closing || @state != :restarting
+        sleep(0.2 * attempt[0])
+        begin
+          connect(timeout: 10, state: :restarting, expected_epoch: attempt[1])
+          @document_lock.synchronize do
+            documents, send_open, connected_epoch = @lock.synchronize do
+              raise Error, "language server restart was cancelled" if @closing || @state != :restarting
 
-                [@documents.values.dup, open_close?, @epoch]
-              end
-              documents.each { |document| notify_open(document) } if send_open
-              @lock.synchronize do
-                raise Error, "language server restart was cancelled" if @closing || @state != :restarting || @epoch != epoch
-
-                @state = :running
-              end
+              [@documents.values.dup, open_close?, @epoch]
             end
-            break
-          rescue StandardError => failure
-            report_error(failure)
+            documents.each { |document| notify_open(document) } if send_open
+            @lock.synchronize do
+              if @closing || @state != :restarting || @epoch != connected_epoch
+                raise Error, "language server restart was cancelled"
+              end
+              @state = :running
+            end
           end
+          break
+        rescue StandardError => failure
+          report_error(failure)
+          epoch = @lock.synchronize { @epoch if @state == :failed && !@closing }
+          break unless epoch
         end
       end
     end
