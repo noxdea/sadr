@@ -3,6 +3,36 @@
 require_relative "test_helper"
 
 class ClientTest < Minitest::Test
+  class BlockingWriter
+    attr_reader :closed, :entered
+
+    def initialize(io)
+      @io = io
+      @entered = Queue.new
+      @closed = Queue.new
+      @release = Queue.new
+      @first = true
+    end
+
+    def write(value)
+      if @first
+        @first = false
+        @entered << true
+        @release.pop
+      end
+      @io.write(value)
+    end
+
+    def flush = @io.flush
+    def closed? = @io.closed?
+
+    def close
+      @closed << true
+      @release << true
+      @io.close unless @io.closed?
+    end
+  end
+
   POSITION = Sadr::Position.new(line: 0, character: 2)
   RANGE = Sadr::Range_.new(start: POSITION, end: Sadr::Position.new(line: 0, character: 3))
 
@@ -79,8 +109,9 @@ class ClientTest < Minitest::Test
       client.diagnostic(uri, previous_result_id: "previous").await
       client.workspace_symbols("q").await
       assert_equal "x", client.resolve_completion("label" => "x").await["label"]
-      assert_equal "quickfix", client.resolve_code_action("kind" => "quickfix").await["kind"]
-      assert_equal "lens", client.resolve_code_lens("command" => "lens").await["command"]
+      assert_equal "quickfix", client.resolve_code_action("title" => "Fix", "kind" => "quickfix").await["kind"]
+      lens = {"range" => {"start" => {"line" => 0, "character" => 0}, "end" => {"line" => 0, "character" => 1}}, "command" => "lens"}
+      assert_equal "lens", client.resolve_code_lens(lens).await["command"]
       assert_equal [1], client.execute_command("run", arguments: [1]).await["arguments"]
 
       messages = probe(client)
@@ -204,6 +235,38 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_semantic_refresh_rejects_an_inflight_result_from_the_old_generation
+    with_client(env: {"SADR_SEMANTIC_REFRESH" => "1"}) do |client|
+      uri = client.open(document)
+      assert_equal [], client.semantic_tokens(uri, version: 0)
+      assert_equal 1, client.semantic_tokens(uri, version: 0).first.length
+
+      messages = probe(client)
+      assert_equal 2, messages.count { |message| message["method"] == "textDocument/semanticTokens/full" }
+      assert_equal 0, messages.count { |message| message["method"] == "textDocument/semanticTokens/full/delta" }
+    end
+  end
+
+  def test_stopping_closes_the_transport_while_a_document_write_is_blocked
+    with_client do |client|
+      uri = client.open(document)
+      transport = client.transport
+      writer = BlockingWriter.new(transport.instance_variable_get(:@stdin))
+      transport.instance_variable_set(:@stdin, writer)
+      change = Thread.new do
+        client.change(uri, 1, [Sadr::ContentChange.new(range: nil, text: "new")])
+      rescue Sadr::Error
+        nil
+      end
+      wait_until { !writer.entered.empty? }
+
+      stopping = Thread.new { client.stop }
+      assert stopping.join(3), "stop remained blocked behind a document write"
+      assert change.join(3), "document write did not unblock after transport close"
+      refute writer.closed.empty?
+    end
+  end
+
   def test_invalid_wrapper_response_fails_only_its_future
     with_client(env: {"SADR_INVALID_METHOD" => "textDocument/hover"}) do |client|
       uri = client.open(document)
@@ -214,6 +277,23 @@ class ClientTest < Minitest::Test
     with_client(env: {"SADR_INVALID_METHOD" => "textDocument/formatting"}) do |client|
       uri = client.open(document)
       assert_raises(Sadr::Error) { client.formatting(uri, tabSize: 2).await }
+      assert client.running?
+    end
+  end
+
+  def test_invalid_wrapper_elements_fail_only_their_futures
+    with_client(env: {"SADR_INVALID_ELEMENTS" => "1"}) do |client|
+      uri = client.open(document)
+      requests = [
+        -> { client.completion(uri, POSITION) },
+        -> { client.definition(uri, POSITION) },
+        -> { client.code_action(uri, RANGE, diagnostics: []) },
+        -> { client.code_lens(uri) },
+        -> { client.inlay_hint(uri, RANGE) },
+        -> { client.diagnostic(uri) }
+      ]
+      requests.each { |request| assert_raises(Sadr::Error) { request.call.await } }
+      assert probe(client).is_a?(Array)
       assert client.running?
     end
   end

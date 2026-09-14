@@ -15,6 +15,7 @@ module Sadr
         end
 
         messages = []
+        semantic_refreshed = false
         loop do
           headers = {}
           while (line = STDIN.gets) && line != "\r\n"
@@ -48,6 +49,11 @@ module Sadr
           when "crash"
             exit!(1)
           when "textDocument/semanticTokens/full"
+            if ENV["SADR_SEMANTIC_REFRESH"] && !semantic_refreshed
+              semantic_refreshed = true
+              send_message(jsonrpc: "2.0", id: "semantic-refresh", method: "workspace/semanticTokens/refresh", params: {})
+              sleep(0.02)
+            end
             if ENV["SADR_SEMANTIC_DELAY"]
               send_message(jsonrpc: "2.0", method: "semantic_started", params: {})
               sleep(Float(ENV["SADR_SEMANTIC_DELAY"]))
@@ -70,6 +76,15 @@ module Sadr
           end
           if ENV["SADR_INVALID_METHOD"] == message["method"]
             result = message["method"] == "textDocument/formatting" ? [{range: {}, newText: "x"}] : "invalid"
+          end
+          if ENV["SADR_INVALID_ELEMENTS"]
+            result = case message["method"]
+            when "textDocument/completion" then [{}]
+            when "textDocument/definition" then {}
+            when "textDocument/codeAction", "textDocument/codeLens", "textDocument/inlayHint" then [1]
+            when "textDocument/diagnostic" then {}
+            else result
+            end
           end
           send_message(jsonrpc: "2.0", id: message["id"], result: result)
         end

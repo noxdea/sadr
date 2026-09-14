@@ -44,9 +44,11 @@ module Sadr
       @semantic = {}
       @sequence = 0
       @lock = Mutex.new
+      @document_lock = Mutex.new
       @state = :stopped
       @restarts = 0
       @epoch = 0
+      @semantic_generation = 0
       @errors = []
       @capabilities = {}
     end
@@ -66,16 +68,19 @@ module Sadr
         @closing = true
         @state == :running
       end
+      graceful = running && @document_lock.try_lock
       begin
-        request("shutdown").await(timeout: 2) if running
-        notify("exit") if @transport&.alive?
+        request("shutdown").await(timeout: 2) if graceful
+        notify("exit") if graceful && @transport&.alive?
       rescue Error
         nil
       ensure
+        @document_lock.unlock if graceful
         @lock.synchronize do
           @epoch += 1
           @documents.clear
           @semantic.clear
+          @semantic_generation += 1
           @diagnostics.clear
           @state = :stopped
         end
@@ -84,7 +89,10 @@ module Sadr
       end
     end
 
-    def running? = @state == :running && !!@transport&.alive?
+    def running?
+      transport = @lock.synchronize { @transport if @state == :running && !@closing }
+      !!transport&.alive?
+    end
 
     def request(method, params = {})
       send_request(method, params, nil)
@@ -108,47 +116,56 @@ module Sadr
       validate_document(document)
       stored = Document.new(uri: document.uri.dup.freeze, language_id: document.language_id.dup.freeze,
         version: document.version, text: document.text.dup.freeze)
-      @lock.synchronize do
-        @documents[stored.uri] = stored
-        @diagnostics.delete(stored.uri)
-        @semantic.delete(stored.uri)
-        notify_open(stored) if open_close?
+      @document_lock.synchronize do
+        send_open = @lock.synchronize do
+          ensure_running!
+          @documents[stored.uri] = stored
+          @diagnostics.delete(stored.uri)
+          @semantic.delete(stored.uri)
+          open_close?
+        end
+        notify_open(stored) if send_open
       end
       stored.uri
     end
 
     def change(uri, version, changes)
-      @lock.synchronize do
-        document = @documents.fetch(uri) { raise Error, "document is not open" }
-        unless Protocol.uint?(version) && version > document.version
-          raise Error, "document version must increase"
-        end
-        raise Error, "content changes must be a nonempty Array" unless changes.is_a?(Array) && !changes.empty?
-
-        text = document.text
-        wire_changes = changes.map do |change|
-          validate_change(change)
-          if change.range
-            index = DocumentIndex.new(text)
-            first = Protocol.offset(index, change.range.start)
-            last = Protocol.offset(index, change.range.end)
-            raise Error, "invalid content change range" if last < first
-
-            text = text.byteslice(0, first) + change.text + text.byteslice(last, text.bytesize - last)
-            {range: Protocol.range_hash(change.range), text: change.text}
-          else
-            text = change.text
-            {text: change.text}
+      @document_lock.synchronize do
+        updated, notification = @lock.synchronize do
+          ensure_running!
+          document = @documents.fetch(uri) { raise Error, "document is not open" }
+          unless Protocol.uint?(version) && version > document.version
+            raise Error, "document version must increase"
           end
-        end
-        updated = Document.new(uri: document.uri, language_id: document.language_id, version: version, text: text.freeze)
-        @documents[uri] = updated
+          raise Error, "content changes must be a nonempty Array" unless changes.is_a?(Array) && !changes.empty?
 
-        mode = sync_mode
-        if [1, 2].include?(mode)
-          content_changes = mode == 2 ? wire_changes : [{text: text}]
-          notify("textDocument/didChange", {textDocument: {uri: uri, version: version}, contentChanges: content_changes})
+          text = document.text
+          wire_changes = changes.map do |change|
+            validate_change(change)
+            if change.range
+              index = DocumentIndex.new(text)
+              first = Protocol.offset(index, change.range.start)
+              last = Protocol.offset(index, change.range.end)
+              raise Error, "invalid content change range" if last < first
+
+              text = text.byteslice(0, first) + change.text + text.byteslice(last, text.bytesize - last)
+              {range: Protocol.range_hash(change.range), text: change.text}
+            else
+              text = change.text
+              {text: change.text}
+            end
+          end
+          updated = Document.new(uri: document.uri, language_id: document.language_id, version: version, text: text.freeze)
+          @documents[uri] = updated
+
+          mode = sync_mode
+          notification = if [1, 2].include?(mode)
+            content_changes = mode == 2 ? wire_changes : [{text: text}]
+            {textDocument: {uri: uri, version: version}, contentChanges: content_changes}
+          end
+          [updated, notification]
         end
+        notify("textDocument/didChange", notification) if notification
         updated
       end
     rescue KeyError
@@ -156,30 +173,38 @@ module Sadr
     end
 
     def save(uri, text: nil)
-      @lock.synchronize do
-        document = @documents.fetch(uri) { raise Error, "document is not open" }
-        sync = @capabilities["textDocumentSync"]
-        save = sync.is_a?(Hash) ? sync["save"] : sync.is_a?(Integer) && sync.positive?
-        return unless save
+      @document_lock.synchronize do
+        params = @lock.synchronize do
+          ensure_running!
+          document = @documents.fetch(uri) { raise Error, "document is not open" }
+          sync = @capabilities["textDocumentSync"]
+          save = sync.is_a?(Hash) ? sync["save"] : sync.is_a?(Integer) && sync.positive?
+          next unless save
 
-        if text
-          raise Error, "saved text must be valid UTF-8" unless text.is_a?(String) && text.valid_encoding?
+          if text
+            raise Error, "saved text must be valid UTF-8" unless text.is_a?(String) && text.valid_encoding?
+          end
+          value = {textDocument: {uri: uri}}
+          value[:text] = text || document.text if save.is_a?(Hash) && save["includeText"]
+          value
         end
-        params = {textDocument: {uri: uri}}
-        params[:text] = text || document.text if save.is_a?(Hash) && save["includeText"]
-        notify("textDocument/didSave", params)
+        notify("textDocument/didSave", params) if params
       end
     rescue KeyError
       raise Error, "document is not open"
     end
 
     def close(uri)
-      @lock.synchronize do
-        raise Error, "document is not open" unless @documents.delete(uri)
+      @document_lock.synchronize do
+        send_close = @lock.synchronize do
+          ensure_running!
+          raise Error, "document is not open" unless @documents.delete(uri)
 
-        @diagnostics.delete(uri)
-        @semantic.delete(uri)
-        notify("textDocument/didClose", {textDocument: {uri: uri}}) if open_close?
+          @diagnostics.delete(uri)
+          @semantic.delete(uri)
+          open_close?
+        end
+        notify("textDocument/didClose", {textDocument: {uri: uri}}) if send_close
       end
     end
 
@@ -227,10 +252,10 @@ module Sadr
     end
 
     def semantic_tokens(uri, version:)
-      document, provider, previous = @lock.synchronize do
+      document, provider, previous, generation = @lock.synchronize do
         document = @documents[uri]
         provider = @capabilities["semanticTokensProvider"]
-        [document, provider, @semantic[uri]]
+        [document, provider, @semantic[uri], @semantic_generation]
       end
       return [] unless document && document.version == version
       return [] unless provider.is_a?(Hash) && provider["full"]
@@ -243,7 +268,7 @@ module Sadr
 
       @lock.synchronize do
         current = @documents[uri]
-        return [] unless result && current.equal?(document) && current.version == version
+        return [] unless result && current.equal?(document) && current.version == version && generation == @semantic_generation
 
         raise Error, "unexpected semantic token delta" if !delta && !result.key?("data")
 
@@ -299,6 +324,7 @@ module Sadr
         @state = state
         @epoch += 1
         @semantic.clear
+        @semantic_generation += 1
         @epoch
       end
       @transport = Transport.new(@command, cwd: @root, env: @env) do |message, error|
@@ -344,9 +370,10 @@ module Sadr
       when :array_or_nil
         valid = value.nil? || value.is_a?(Array)
       when :locations
-        valid = value.nil? || value.is_a?(Hash) || value.is_a?(Array)
+        valid = value.nil? || valid_locations?(value)
       when :completion
-        valid = value.nil? || value.is_a?(Array) || (value.is_a?(Hash) && value["items"].is_a?(Array))
+        items = value.is_a?(Hash) ? value["items"] : value
+        valid = value.nil? || (items.is_a?(Array) && items.all? { |item| valid_completion_item?(item) })
       when :workspace_edit
         valid = value.nil?
         Protocol.workspace_edit(value) unless valid
@@ -357,22 +384,25 @@ module Sadr
         valid = true
       when :code_actions
         valid = value.nil? || value.is_a?(Array)
-        value&.each { |action| Protocol.workspace_edit(action["edit"]) if action.is_a?(Hash) && action["edit"] }
+        value&.each do |action|
+          raise Error, "invalid LSP response" unless valid_code_action?(action)
+
+          Protocol.workspace_edit(action["edit"]) if action["edit"]
+        end
       when :code_action
-        valid = value.is_a?(Hash)
+        valid = valid_code_action?(value)
         Protocol.workspace_edit(value["edit"]) if valid && value["edit"]
       when :code_lenses
         valid = value.nil? || value.is_a?(Array)
-        value&.each { |lens| Protocol.range_value(lens["range"]) if lens.is_a?(Hash) && lens["range"] }
+        value&.each { |lens| validate_code_lens(lens) }
       when :code_lens
         valid = value.is_a?(Hash)
-        Protocol.range_value(value["range"]) if valid && value["range"]
+        validate_code_lens(value) if valid
       when :inlay_hints
         valid = value.nil? || value.is_a?(Array)
-        value&.each { |hint| Protocol.position_value(hint["position"]) if hint.is_a?(Hash) && hint["position"] }
+        value&.each { |hint| validate_inlay_hint(hint) }
       when :diagnostic
-        valid = value.nil? || value.is_a?(Hash)
-        Protocol.diagnostics(value["items"]) if value.is_a?(Hash) && value["items"]
+        valid = value.nil? || valid_diagnostic_report?(value)
       when :semantic
         valid = value.nil? || (value.is_a?(Hash) &&
           (!value.key?("resultId") || value["resultId"].is_a?(String)) &&
@@ -386,6 +416,62 @@ module Sadr
       value
     rescue KeyError, NoMethodError
       raise Error, "invalid LSP response"
+    end
+
+    def valid_completion_item?(item)
+      item.is_a?(Hash) && item["label"].is_a?(String)
+    end
+
+    def valid_locations?(value)
+      locations = value.is_a?(Array) ? value : [value]
+      locations.all? do |location|
+        next false unless location.is_a?(Hash)
+
+        if location["uri"]
+          valid_uri(location["uri"])
+          Protocol.range_value(location.fetch("range"))
+        elsif location["targetUri"]
+          valid_uri(location["targetUri"])
+          Protocol.range_value(location.fetch("targetRange"))
+          Protocol.range_value(location.fetch("targetSelectionRange"))
+          Protocol.range_value(location["originSelectionRange"]) if location["originSelectionRange"]
+          true
+        else
+          false
+        end
+      end
+    end
+
+    def valid_code_action?(action)
+      action.is_a?(Hash) && action["title"].is_a?(String)
+    end
+
+    def validate_code_lens(lens)
+      raise Error, "invalid LSP response" unless lens.is_a?(Hash)
+
+      Protocol.range_value(lens.fetch("range"))
+    end
+
+    def validate_inlay_hint(hint)
+      label = hint["label"] if hint.is_a?(Hash)
+      valid_label = label.is_a?(String) || (label.is_a?(Array) && label.all? { |part| part.is_a?(Hash) && part["value"].is_a?(String) })
+      raise Error, "invalid LSP response" unless valid_label
+
+      Protocol.position_value(hint.fetch("position"))
+    end
+
+    def valid_diagnostic_report?(report)
+      return false unless report.is_a?(Hash)
+
+      case report["kind"]
+      when "full"
+        Protocol.diagnostics(report.fetch("items"))
+        true
+      when "unchanged"
+        report["resultId"].is_a?(String)
+      else
+        false
+      end
     end
 
     def validate_text_edits(value)
@@ -451,6 +537,10 @@ module Sadr
       unless document.text.is_a?(String) && document.text.valid_encoding?
         raise Error, "document text must be valid UTF-8"
       end
+    end
+
+    def ensure_running!
+      raise Error, "language server is not running" unless @state == :running && !@closing
     end
 
     def validate_change(change)
@@ -612,7 +702,12 @@ module Sadr
       when "workspace/workspaceFolders"
         [true, [{uri: Protocol.uri(@root), name: File.basename(@root)}]]
       when "window/workDoneProgress/create", "workspace/semanticTokens/refresh", "workspace/inlayHint/refresh", "workspace/codeLens/refresh", "workspace/diagnostic/refresh"
-        @lock.synchronize { @semantic.clear } if method == "workspace/semanticTokens/refresh"
+        if method == "workspace/semanticTokens/refresh"
+          @lock.synchronize do
+            @semantic.clear
+            @semantic_generation += 1
+          end
+        end
         [true, nil]
       else
         [false, nil]
@@ -660,11 +755,18 @@ module Sadr
 
           begin
             connect(timeout: 10, state: :restarting)
-            @lock.synchronize do
-              raise Error, "language server restart was cancelled" if @closing || @state != :restarting
+            @document_lock.synchronize do
+              documents, send_open, epoch = @lock.synchronize do
+                raise Error, "language server restart was cancelled" if @closing || @state != :restarting
 
-              @documents.values.each { |document| notify_open(document) if open_close? }
-              @state = :running
+                [@documents.values.dup, open_close?, @epoch]
+              end
+              documents.each { |document| notify_open(document) } if send_open
+              @lock.synchronize do
+                raise Error, "language server restart was cancelled" if @closing || @state != :restarting || @epoch != epoch
+
+                @state = :running
+              end
             end
             break
           rescue StandardError => failure
