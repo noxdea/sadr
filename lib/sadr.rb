@@ -27,10 +27,34 @@ module Sadr
     def define(*members)
       return Data.define(*members) if defined?(Data)
 
-      Struct.new(*members, keyword_init: true) do
-        def initialize(**values)
-          super
+      Struct.new(*members) do
+        members.each { |member| undef_method("#{member}=") }
+
+        def initialize(*values, **keywords)
+          if keywords.empty?
+            raise ArgumentError, "wrong number of arguments" unless values.length == self.class.members.length
+
+            super(*values)
+          else
+            raise ArgumentError, "cannot mix positional and keyword arguments" unless values.empty?
+
+            missing = self.class.members - keywords.keys
+            unknown = keywords.keys - self.class.members
+            raise ArgumentError, "missing keyword: #{missing.first.inspect}" unless missing.empty?
+            raise ArgumentError, "unknown keyword: #{unknown.first.inspect}" unless unknown.empty?
+
+            super(*self.class.members.map { |member| keywords.fetch(member) })
+          end
           freeze
+        end
+
+        def with(**changes)
+          return self if changes.empty?
+
+          unknown = changes.keys - self.class.members
+          raise ArgumentError, "unknown keyword: #{unknown.first.inspect}" unless unknown.empty?
+
+          self.class.new(**to_h.merge(changes))
         end
       end
     end

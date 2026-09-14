@@ -48,13 +48,28 @@ module Sadr
           when "crash"
             exit!(1)
           when "textDocument/semanticTokens/full"
+            if ENV["SADR_SEMANTIC_DELAY"]
+              send_message(jsonrpc: "2.0", method: "semantic_started", params: {})
+              sleep(Float(ENV["SADR_SEMANTIC_DELAY"]))
+            end
             result = {resultId: "first", data: [0, 0, 1, 0, 0]}
           when "textDocument/semanticTokens/full/delta"
             result = {resultId: "second", edits: [{start: 2, deleteCount: 1, data: [2]}]}
           when "shutdown"
             result = nil
+          when "textDocument/completion", "textDocument/definition", "textDocument/typeDefinition", "textDocument/implementation", "textDocument/references", "textDocument/documentSymbol", "textDocument/formatting", "textDocument/codeAction", "textDocument/codeLens", "textDocument/inlayHint", "workspace/symbol"
+            result = []
+          when "textDocument/signatureHelp"
+            result = nil
+          when "textDocument/rename"
+            result = {changes: {}}
+          when "textDocument/diagnostic"
+            result = {kind: "full", items: []}
           else
             result = message["params"]
+          end
+          if ENV["SADR_INVALID_METHOD"] == message["method"]
+            result = message["method"] == "textDocument/formatting" ? [{range: {}, newText: "x"}] : "invalid"
           end
           send_message(jsonrpc: "2.0", id: message["id"], result: result)
         end

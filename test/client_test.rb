@@ -7,7 +7,9 @@ class ClientTest < Minitest::Test
   RANGE = Sadr::Range_.new(start: POSITION, end: Sadr::Position.new(line: 0, character: 3))
 
   def with_client(restart: false, command: Sadr::Testing::FakeServer.command, **options)
-    instance = Sadr::Client.new(command: command, restart: restart, **options).start(timeout: 3)
+    instance = Sadr::Client.new(command: command, restart: restart, **options)
+    capabilities = instance.start(timeout: 3)
+    assert_same capabilities, instance.capabilities
     yield instance
   ensure
     instance&.stop
@@ -61,25 +63,32 @@ class ClientTest < Minitest::Test
         signature_help: "signatureHelp"
       }
       position_methods.each do |ruby_name, lsp_name|
-        result = client.public_send(ruby_name, uri, POSITION).await
-        assert_equal uri, result.dig("textDocument", "uri")
-        assert_equal({"line" => 0, "character" => 2}, result["position"])
-        assert probe(client).any? { |message| message["method"] == "textDocument/#{lsp_name}" }
+        client.public_send(ruby_name, uri, POSITION).await
+        request = probe(client).reverse.find { |message| message["method"] == "textDocument/#{lsp_name}" }
+        assert_equal uri, request.dig("params", "textDocument", "uri")
+        assert_equal({"line" => 0, "character" => 2}, request.dig("params", "position"))
       end
 
-      assert_equal true, client.references(uri, POSITION).await.dig("context", "includeDeclaration")
-      assert_equal "renamed", client.rename(uri, POSITION, "renamed").await["newName"]
-      assert_equal uri, client.document_symbol(uri).await.dig("textDocument", "uri")
-      assert_equal 2, client.formatting(uri, tabSize: 2).await.dig("options", "tabSize")
-      assert_equal [], client.code_action(uri, RANGE, diagnostics: []).await.dig("context", "diagnostics")
-      assert_equal uri, client.code_lens(uri).await.dig("textDocument", "uri")
-      assert_equal({"line" => 0, "character" => 2}, client.inlay_hint(uri, RANGE).await.dig("range", "start"))
-      assert_equal "previous", client.diagnostic(uri, previous_result_id: "previous").await["previousResultId"]
-      assert_equal "q", client.workspace_symbols("q").await["query"]
+      client.references(uri, POSITION).await
+      client.rename(uri, POSITION, "renamed").await
+      client.document_symbol(uri).await
+      client.formatting(uri, tabSize: 2).await
+      client.code_action(uri, RANGE, diagnostics: []).await
+      client.code_lens(uri).await
+      client.inlay_hint(uri, RANGE).await
+      client.diagnostic(uri, previous_result_id: "previous").await
+      client.workspace_symbols("q").await
       assert_equal "x", client.resolve_completion("label" => "x").await["label"]
       assert_equal "quickfix", client.resolve_code_action("kind" => "quickfix").await["kind"]
       assert_equal "lens", client.resolve_code_lens("command" => "lens").await["command"]
       assert_equal [1], client.execute_command("run", arguments: [1]).await["arguments"]
+
+      messages = probe(client)
+      assert_equal true, messages.reverse.find { |message| message["method"] == "textDocument/references" }.dig("params", "context", "includeDeclaration")
+      assert_equal "renamed", messages.reverse.find { |message| message["method"] == "textDocument/rename" }.dig("params", "newName")
+      assert_equal 2, messages.reverse.find { |message| message["method"] == "textDocument/formatting" }.dig("params", "options", "tabSize")
+      assert_equal "previous", messages.reverse.find { |message| message["method"] == "textDocument/diagnostic" }.dig("params", "previousResultId")
+      assert_equal "q", messages.reverse.find { |message| message["method"] == "workspace/symbol" }.dig("params", "query")
     end
   end
 
@@ -98,6 +107,8 @@ class ClientTest < Minitest::Test
 
   def test_server_requests_failures_cancellation_and_stderr_are_contained
     with_client(configuration: {"ruby" => {"lint" => true}}) do |client|
+      assert_raises(Sadr::Error) { client.start }
+      assert client.running?
       client.on("explode") { raise "boom" }
       client.on("error") { raise "error handler also failed" }
       assert client.request("server_request", method: "explode").await
@@ -109,6 +120,16 @@ class ClientTest < Minitest::Test
       assert probe(client).any? { |message| message["id"] == "server-1" && message.dig("error", "code") == -32601 }
       client.request("server_request", method: "workspace/configuration", params: {items: [{section: "ruby.lint"}]}).await
       assert probe(client).any? { |message| message["id"] == "server-1" && message["result"] == [true] }
+
+      deferred = Sadr::Future.new(nil)
+      client.on("deferred") { deferred }
+      client.request("server_request", method: "deferred").await
+      deferred.fulfill(false)
+      assert probe(client).any? { |message| message["id"] == "server-1" && message["result"] == false }
+
+      client.request("probe").then { raise "callback failed" }.await
+      wait_until { client.errors.any? { |error| error.message.include?("callback failed") } }
+      assert probe(client).is_a?(Array)
 
       client.request("never").tap { |future| assert_raises(Sadr::Timeout) { future.await(timeout: 0.01) } }
       assert probe(client).any? { |message| message["method"] == "$/cancelRequest" }
@@ -131,6 +152,69 @@ class ClientTest < Minitest::Test
 
       client.change(uri, 1, [Sadr::ContentChange.new(range: nil, text: "new")])
       assert_equal 1, probe(client).count { |message| message["method"] == "textDocument/didChange" }
+    end
+  end
+
+  def test_running_stays_false_until_restart_reopens_every_document
+    entered = Queue.new
+    release = Queue.new
+    klass = Class.new(Sadr::Client) do
+      define_method(:notify_open) do |value|
+        if state == :restarting
+          entered << true
+          release.pop
+        end
+        super(value)
+      end
+    end
+    client = klass.new(command: Sadr::Testing::FakeServer.command, restart: true)
+    client.start(timeout: 3)
+    client.open(document)
+
+    2.times do
+      assert_raises(Sadr::Error) { client.request("crash").await }
+      wait_until { !entered.empty? }
+      entered.pop
+      assert_equal :restarting, client.state
+      refute client.running?
+      release << true
+      wait_until { client.running? }
+      assert_equal 1, client.request("probe").await.count { |message| message["method"] == "textDocument/didOpen" }
+    end
+  ensure
+    release << true if release
+    client&.stop
+  end
+
+  def test_stale_semantic_response_cannot_repopulate_the_cache
+    started = Queue.new
+    with_client(env: {"SADR_SEMANTIC_DELAY" => "0.05"}) do |client|
+      client.on("semantic_started") { started << true }
+      uri = client.open(document)
+      request = Thread.new { client.semantic_tokens(uri, version: 0) }
+      wait_until { !started.empty? }
+      started.pop
+      client.change(uri, 1, [Sadr::ContentChange.new(range: nil, text: "new")])
+      assert_equal [], request.value
+      assert_equal 1, client.semantic_tokens(uri, version: 1).first.length
+
+      messages = probe(client)
+      assert_equal 2, messages.count { |message| message["method"] == "textDocument/semanticTokens/full" }
+      assert_equal 0, messages.count { |message| message["method"] == "textDocument/semanticTokens/full/delta" }
+    end
+  end
+
+  def test_invalid_wrapper_response_fails_only_its_future
+    with_client(env: {"SADR_INVALID_METHOD" => "textDocument/hover"}) do |client|
+      uri = client.open(document)
+      assert_raises(Sadr::Error) { client.hover(uri, POSITION).await }
+      assert probe(client).is_a?(Array)
+      assert client.running?
+    end
+    with_client(env: {"SADR_INVALID_METHOD" => "textDocument/formatting"}) do |client|
+      uri = client.open(document)
+      assert_raises(Sadr::Error) { client.formatting(uri, tabSize: 2).await }
+      assert client.running?
     end
   end
 
