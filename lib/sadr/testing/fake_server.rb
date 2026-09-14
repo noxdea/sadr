@@ -139,7 +139,7 @@ module Sadr
 
       def self.command = [RbConfig.ruby, "-e", SCRIPT]
 
-      attr_reader :capabilities, :messages
+      attr_reader :capabilities
 
       def initialize(responses: {}, capabilities: DEFAULT_CAPABILITIES)
         raise ArgumentError, "responses must be a Hash" unless responses.is_a?(Hash)
@@ -152,6 +152,8 @@ module Sadr
       end
 
       def transport(&receive) = FakeTransport.new(self, &receive)
+
+      def messages = @lock.synchronize { @messages.dup }
 
       def dispatch(message)
         @lock.synchronize { @messages << message }

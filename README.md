@@ -61,7 +61,13 @@ server = Sadr::Testing::FakeServer.new(responses: {"custom/request" => {"ok" => 
 fast_client = Sadr::Testing::FakeClient.new(server: server)
 ```
 
-Set `SADR_INTEGRATION=1` to include the optional `ruby-lsp` integration test.
+The optional real-server test stays outside the normal bundle and CI. After
+`bundle install`, run it with the same Ruby:
+
+```sh
+gem install ruby-lsp
+SADR_INTEGRATION=1 ruby -Ilib:test test/ruby_lsp_integration_test.rb
+```
 
 ## Development
 
