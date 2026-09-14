@@ -1,0 +1,39 @@
+name: Ruby
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    env:
+      BUNDLE_VERSION: system
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.1', '3.2', '3.3', '3.4', '4.0']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler: default
+          bundler-cache: true
+      - run: bundle exec rake test
+      - run: bundle exec rbs -I sig -r stringio validate
+      - run: gem build --strict sadr.gemspec
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: '3.4'
+          bundler: default
+          bundler-cache: true
+      - run: BUDGET=1 bundle exec rake bench

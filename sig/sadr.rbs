@@ -1,0 +1,152 @@
+module Sadr
+  VERSION: String
+
+  type json = nil | bool | Integer | Float | String | Array[json] | Hash[String | Symbol, json]
+  type object = Hash[String | Symbol, json]
+
+  interface _Point
+    def row: () -> Integer
+    def column: () -> Integer
+  end
+
+  interface _TextIndex
+    def utf16_point_at: (Integer offset) -> _Point
+    def utf16_offset_at: (Integer offset) -> Integer
+    def offset_at_utf16: (Integer offset) -> Integer
+    def line_start: (Integer row) -> Integer
+    def line: (Integer row) -> String
+  end
+
+  module TextIndex
+  end
+
+  class Error < StandardError
+  end
+
+  class Timeout < Error
+  end
+
+  class ServerError < Error
+    attr_reader code: Integer
+    attr_reader data: json
+    def initialize: (Hash[String, json] error) -> void
+  end
+
+  class Position
+    attr_reader line: Integer
+    attr_reader character: Integer
+    def self.new: (line: Integer, character: Integer) -> Position
+  end
+
+  class Range_
+    attr_reader start: Position
+    attr_reader end: Position
+    def self.new: (start: Position, end: Position) -> Range_
+  end
+
+  class ContentChange
+    attr_reader range: Range_?
+    attr_reader text: String
+    def self.new: (range: Range_?, text: String) -> ContentChange
+  end
+
+  class Document
+    attr_reader uri: String
+    attr_reader language_id: String
+    attr_reader version: Integer
+    attr_reader text: String
+    def self.new: (uri: String, language_id: String, version: Integer, text: String) -> Document
+  end
+
+  class Token
+    attr_reader line: Integer
+    attr_reader character: Integer
+    attr_reader length: Integer
+    attr_reader type: Integer
+    attr_reader modifiers: Integer
+    def self.new: (line: Integer, character: Integer, length: Integer, type: Integer, modifiers: Integer) -> Token
+  end
+
+  module Protocol
+    def self.uri: (String path) -> String
+    def self.path: (String uri) -> String
+    def self.position: (_TextIndex index, Integer offset) -> Position
+    def self.offset: (_TextIndex index, Position | Hash[String | Symbol, Integer] position) -> Integer
+    def self.range: (_TextIndex index, ::Range[Integer] range) -> Range_
+    def self.text_edits: (_TextIndex index, Array[object] edits) -> Array[[::Range[Integer], String]]
+    def self.semantic_tokens: (Array[Integer] data, ?legend: Hash[String, Array[String]]?) -> Array[Token]
+    def self.semantic_delta: (Array[Integer] data, Array[Hash[String, json]] edits) -> Array[Integer]
+    def self.diagnostics: (Array[object] values) -> Array[object]
+  end
+
+  class Future
+    class Subscription
+      def initialize: () { () -> untyped } -> void
+      def detach: () -> untyped
+    end
+
+    attr_reader id: Integer | String | nil
+    attr_reader callback_errors: Array[Error]
+    def initialize: (Integer | String | nil id, ?on_error: ^(Error) -> untyped) ?{ (Integer | String | nil) -> untyped } -> void
+    def fulfill: (?untyped value, ?error: Exception?) -> Future?
+    def then: () { (untyped, Exception?) -> untyped } -> Future
+    def done?: () -> bool
+    def on_complete: () { () -> untyped } -> Subscription
+    def await: (?timeout: Numeric?) -> untyped
+    def cancel: () -> bool
+  end
+
+  class Transport
+    MAX_MESSAGE: Integer
+    attr_reader stderr_lines: Array[String]
+    attr_reader pid: Integer
+    def initialize: (Array[String] command, ?cwd: String?, ?env: Hash[String, String?]) { (Hash[String, json]?, Exception?) -> untyped } -> void
+    def self.read_message: (IO | StringIO io) -> Hash[String, json]?
+    def self.validate_message: (untyped message) -> Hash[String, json]
+    def write: (object message) -> untyped
+    def alive?: () -> bool
+    def close: () -> untyped
+  end
+
+  class Client
+    attr_reader capabilities: Hash[String, json]
+    attr_reader transport: Transport?
+    attr_reader diagnostics: Hash[String, Array[object]]
+    attr_reader state: :stopped | :starting | :running | :failed
+    attr_reader errors: Array[Error]
+    attr_reader server_info: Hash[String, json]?
+    attr_reader position_encoding: String?
+    def initialize: (command: Array[String], ?root: String, ?dispatch: ^() { () -> untyped } -> untyped, ?restart: bool, ?env: Hash[String, String?], ?initialization_options: json, ?configuration: object) -> void
+    def start: (?timeout: Numeric) -> self
+    def stop: () -> untyped
+    def running?: () -> bool
+    def supports?: (String | Symbol capability) -> bool
+    def request: (String | Symbol method, ?json params) -> Future
+    def notify: (String | Symbol method, ?json params) -> untyped
+    def on: (String | Symbol method) { (untyped) -> untyped } -> Proc
+    def open: (Document document) -> String
+    def change: (String uri, Integer version, Array[ContentChange] changes) -> Document
+    def save: (String uri, ?text: String?) -> untyped
+    def close: (String uri) -> untyped
+    def completion: (String uri, Position position, **json params) -> Future
+    def hover: (String uri, Position position, **json params) -> Future
+    def definition: (String uri, Position position, **json params) -> Future
+    def type_definition: (String uri, Position position, **json params) -> Future
+    def implementation: (String uri, Position position, **json params) -> Future
+    def references: (String uri, Position position, ?include_declaration: bool) -> Future
+    def signature_help: (String uri, Position position, **json params) -> Future
+    def rename: (String uri, Position position, String new_name) -> Future
+    def document_symbol: (String uri) -> Future
+    def formatting: (String uri, object options) -> Future
+    def code_action: (String uri, Range_ range, object context) -> Future
+    def code_lens: (String uri) -> Future
+    def inlay_hint: (String uri, Range_ range) -> Future
+    def diagnostic: (String uri, ?previous_result_id: String?) -> Future
+    def semantic_tokens: (String uri, version: Integer) -> Array[Token]
+    def workspace_symbols: (String query) -> Future
+    def resolve_completion: (object item) -> Future
+    def resolve_code_action: (object action) -> Future
+    def resolve_code_lens: (object lens) -> Future
+    def execute_command: (String command, ?arguments: Array[json]) -> Future
+  end
+end
