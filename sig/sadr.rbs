@@ -35,19 +35,25 @@ module Sadr
   class Position
     attr_reader line: Integer
     attr_reader character: Integer
-    def self.new: (line: Integer, character: Integer) -> Position
+    def self.new: (Integer line, Integer character) -> Position
+                | (line: Integer, character: Integer) -> Position
+    def with: (?line: Integer, ?character: Integer) -> Position
   end
 
   class Range_
     attr_reader start: Position
     attr_reader end: Position
-    def self.new: (start: Position, end: Position) -> Range_
+    def self.new: (Position start, Position end) -> Range_
+                | (start: Position, end: Position) -> Range_
+    def with: (?start: Position, ?end: Position) -> Range_
   end
 
   class ContentChange
     attr_reader range: Range_?
     attr_reader text: String
-    def self.new: (range: Range_?, text: String) -> ContentChange
+    def self.new: (Range_? range, String text) -> ContentChange
+                | (range: Range_?, text: String) -> ContentChange
+    def with: (?range: Range_?, ?text: String) -> ContentChange
   end
 
   class Document
@@ -55,7 +61,9 @@ module Sadr
     attr_reader language_id: String
     attr_reader version: Integer
     attr_reader text: String
-    def self.new: (uri: String, language_id: String, version: Integer, text: String) -> Document
+    def self.new: (String uri, String language_id, Integer version, String text) -> Document
+                | (uri: String, language_id: String, version: Integer, text: String) -> Document
+    def with: (?uri: String, ?language_id: String, ?version: Integer, ?text: String) -> Document
   end
 
   class Token
@@ -64,7 +72,9 @@ module Sadr
     attr_reader length: Integer
     attr_reader type: Integer
     attr_reader modifiers: Integer
-    def self.new: (line: Integer, character: Integer, length: Integer, type: Integer, modifiers: Integer) -> Token
+    def self.new: (Integer line, Integer character, Integer length, Integer type, Integer modifiers) -> Token
+                | (line: Integer, character: Integer, length: Integer, type: Integer, modifiers: Integer) -> Token
+    def with: (?line: Integer, ?character: Integer, ?length: Integer, ?type: Integer, ?modifiers: Integer) -> Token
   end
 
   module Protocol
@@ -77,6 +87,7 @@ module Sadr
     def self.semantic_tokens: (Array[Integer] data, ?legend: Hash[String, Array[String]]?) -> Array[Token]
     def self.semantic_delta: (Array[Integer] data, Array[Hash[String, json]] edits) -> Array[Integer]
     def self.diagnostics: (Array[object] values) -> Array[object]
+    def self.workspace_edit: (object value) -> object
   end
 
   class Future
@@ -112,12 +123,12 @@ module Sadr
     attr_reader capabilities: Hash[String, json]
     attr_reader transport: Transport?
     attr_reader diagnostics: Hash[String, Array[object]]
-    attr_reader state: :stopped | :starting | :running | :failed
+    attr_reader state: :stopped | :starting | :restarting | :running | :failed
     attr_reader errors: Array[Error]
     attr_reader server_info: Hash[String, json]?
     attr_reader position_encoding: String?
     def initialize: (command: Array[String], ?root: String, ?dispatch: ^() { () -> untyped } -> untyped, ?restart: bool, ?env: Hash[String, String?], ?initialization_options: json, ?configuration: object) -> void
-    def start: (?timeout: Numeric) -> self
+    def start: (?timeout: Numeric) -> Hash[String, json]
     def stop: () -> untyped
     def running?: () -> bool
     def supports?: (String | Symbol capability) -> bool

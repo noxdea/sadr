@@ -15,7 +15,8 @@ gem "sadr"
 ```ruby
 require "sadr"
 
-client = Sadr::Client.new(command: ["ruby-lsp"]).start
+client = Sadr::Client.new(command: ["ruby-lsp"])
+capabilities = client.start
 document = Sadr::Document.new(
   uri: Sadr::Protocol.uri("example.rb"),
   language_id: "ruby",
