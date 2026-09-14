@@ -161,4 +161,32 @@ module Sadr
     def resolve_code_lens: (object lens) -> Future
     def execute_command: (String command, ?arguments: Array[json]) -> Future
   end
+
+  module Testing
+    class FakeServer
+      SCRIPT: String
+      DEFAULT_CAPABILITIES: Hash[String, json]
+      attr_reader capabilities: Hash[String, json]
+      attr_reader messages: Array[object]
+      def self.command: () -> Array[String]
+      def initialize: (?responses: Hash[String | Symbol, untyped], ?capabilities: Hash[String, json]) -> void
+      def transport: () { (Hash[String, json]?, Exception?) -> untyped } -> FakeTransport
+      def dispatch: (object message) -> Array[object]
+    end
+
+    class FakeTransport < Transport
+      attr_reader stderr_lines: Array[String]
+      attr_reader pid: Integer
+      def initialize: (FakeServer server) { (Hash[String, json]?, Exception?) -> untyped } -> void
+      def write: (object message) -> nil
+      def try_write: (object message) -> bool
+      def alive?: () -> bool
+      def close: () -> nil
+    end
+
+    class FakeClient < Client
+      attr_reader server: FakeServer
+      def initialize: (?server: FakeServer, **untyped options) -> void
+    end
+  end
 end
