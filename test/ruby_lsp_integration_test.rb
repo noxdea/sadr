@@ -21,7 +21,7 @@ class RubyLspIntegrationTest < Minitest::Test
     ensure
       client&.stop
     end
-  rescue Gem::GemNotFoundException
+  rescue Gem::Exception
     skip "SADR_INTEGRATION=1 requires the ruby-lsp gem"
   end
 end

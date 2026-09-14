@@ -147,8 +147,9 @@ module Sadr
         raise Error, "invalid semantic token legend" unless valid
       end
 
-      unless data.empty? || (data.all?(Integer) && data.min >= 0 && data.max <= 0x7fffffff)
-        raise Error, "invalid semantic token value"
+      unless data.empty?
+        minimum, maximum = data.minmax if data.all?(Integer)
+        raise Error, "invalid semantic token value" unless minimum && minimum >= 0 && maximum <= 0x7fffffff
       end
       row = 0
       column = 0
