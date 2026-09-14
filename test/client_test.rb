@@ -84,6 +84,32 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_invalid_publish_diagnostics_are_isolated_without_polluting_state
+    with_client do |client|
+      invalid_version_uri = Sadr::Protocol.uri(File.expand_path("invalid-version.rb"))
+      legal_uri = Sadr::Protocol.uri(File.expand_path("legal-version.rb"))
+      nullable_uri = Sadr::Protocol.uri(File.expand_path("nullable-version.rb"))
+      initial_errors = client.errors.length
+
+      client.request("server_notification", method: "textDocument/publishDiagnostics",
+        params: {uri: "not a URI", diagnostics: []}).await
+      client.request("server_notification", method: "textDocument/publishDiagnostics",
+        params: {uri: invalid_version_uri, version: 0x80000000, diagnostics: []}).await
+      client.request("server_notification", method: "textDocument/publishDiagnostics",
+        params: {uri: legal_uri, version: -1, diagnostics: []}).await
+      client.request("server_notification", method: "textDocument/publishDiagnostics",
+        params: {uri: nullable_uri, version: nil, diagnostics: []}).await
+
+      wait_until { client.errors.length == initial_errors + 2 }
+      refute client.diagnostics.key?("not a URI")
+      refute client.diagnostics.key?(invalid_version_uri)
+      assert_equal [], client.diagnostics[legal_uri]
+      assert_equal [], client.diagnostics[nullable_uri]
+      assert client.running?
+      assert probe(client).is_a?(Array)
+    end
+  end
+
   def test_public_request_wrappers_use_uri_positions_and_protocol_names
     with_client do |client|
       uri = client.open(document)
