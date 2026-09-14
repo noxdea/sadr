@@ -154,6 +154,27 @@ module Sadr
           minimum >= 0 && maximum <= 0x7fffffff
         raise Error, "invalid semantic token value" unless valid
       end
+      unless collect || legend
+        row = 0
+        column = 0
+        index = 2
+        size = data.length
+        while index < size
+          length = data[index]
+          delta_row = data[index - 2]
+          delta_column = data[index - 1]
+          raise Error, "invalid semantic token value" if length.zero?
+
+          row += delta_row
+          column = delta_row.zero? ? column + delta_column : delta_column
+          raise Error, "semantic token position overflow" if column + length > 0x7fffffff
+
+          index += 5
+        end
+        raise Error, "semantic token position overflow" if row > 0x7fffffff
+
+        return nil
+      end
       row = 0
       column = 0
       tokens = collect ? Array.new(data.length / 5) : nil
