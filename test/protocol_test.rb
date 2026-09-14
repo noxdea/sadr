@@ -95,6 +95,24 @@ class ProtocolTest < Minitest::Test
     end
   end
 
+  def test_semantic_delta_fast_path_matches_token_validation
+    non_integer = Object.new
+    def non_integer.coerce(*) = raise "coercion attempted"
+
+    invalid = [
+      [0, 0, 0, 0, 0], [0, 0, 1, -1, 0], [0, 0, 1, 0, 1 << 31],
+      [0, 0, 1.0, 0, 0], [0, 0, 1, 0, non_integer], [1],
+      [0x7fffffff, 0, 1, 0, 0, 1, 0, 1, 0, 0],
+      [0, 0x7ffffffe, 1, 0, 0, 0, 1, 1, 0, 0]
+    ]
+    invalid.each do |data|
+      assert_raises(Sadr::Error) { Sadr::Protocol.semantic_tokens(data) }
+      assert_raises(Sadr::Error) { Sadr::Protocol.semantic_delta(data, []) }
+    end
+
+    boundary = [0x7fffffff, 0x7ffffffe, 1, 0x7fffffff, 0x7fffffff]
+    assert_equal boundary, Sadr::Protocol.semantic_delta(boundary, [])
+  end
 
   def test_workspace_edits_validate_known_shapes_and_preserve_extensions
     range = {"start" => {"line" => 0, "character" => 0}, "end" => {"line" => 0, "character" => 1}}
