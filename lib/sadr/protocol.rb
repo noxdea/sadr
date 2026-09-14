@@ -148,8 +148,12 @@ module Sadr
       end
 
       unless data.empty?
-        total = data.sum
-        minimum, maximum = data.minmax
+        begin
+          total = data.sum
+          minimum, maximum = data.minmax
+        rescue StandardError
+          raise Error, "invalid semantic token value"
+        end
         valid = total.is_a?(Integer) && minimum.is_a?(Integer) && maximum.is_a?(Integer) &&
           minimum >= 0 && maximum <= 0x7fffffff
         raise Error, "invalid semantic token value" unless valid
