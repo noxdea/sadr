@@ -14,6 +14,8 @@ module Sadr
           STDOUT.write("Content-Length: #{body.bytesize}\r\n\r\n#{body}")
         end
 
+        range = {start: {line: 0, character: 0}, end: {line: 0, character: 1}}
+        command = {title: "Run", command: "run", arguments: []}
         messages = []
         semantic_refreshed = false
         loop do
@@ -63,10 +65,24 @@ module Sadr
             result = {resultId: "second", edits: [{start: 2, deleteCount: 1, data: [2]}]}
           when "shutdown"
             result = nil
-          when "textDocument/completion", "textDocument/definition", "textDocument/typeDefinition", "textDocument/implementation", "textDocument/references", "textDocument/documentSymbol", "textDocument/formatting", "textDocument/codeAction", "textDocument/codeLens", "textDocument/inlayHint", "workspace/symbol"
-            result = []
+          when "textDocument/completion"
+            result = {isIncomplete: false, items: [{label: "x", detail: "optional"}], itemDefaults: {commitCharacters: ["."]}}
+          when "textDocument/hover"
+            result = {contents: {kind: "markdown", value: "hover"}, range: range, extension: true}
           when "textDocument/signatureHelp"
-            result = nil
+            result = {signatures: [{label: "f(x)", parameters: [{label: [2, 3]}]}], activeSignature: 0}
+          when "textDocument/documentSymbol"
+            result = [{name: "x", kind: 13, range: range, selectionRange: range, children: []}]
+          when "workspace/symbol"
+            result = [{name: "x", kind: 13, location: {uri: "file:///tmp/test.rb"}, data: {optional: true}}]
+          when "textDocument/codeAction"
+            result = [{title: "Fix", command: command}]
+          when "textDocument/codeLens"
+            result = [{range: range, command: command, data: {optional: true}}]
+          when "textDocument/inlayHint"
+            result = [{position: {line: 0, character: 0}, label: [{value: "x", tooltip: "optional"}]}]
+          when "textDocument/definition", "textDocument/typeDefinition", "textDocument/implementation", "textDocument/references", "textDocument/formatting"
+            result = []
           when "textDocument/rename"
             result = {changes: {}}
           when "textDocument/diagnostic"
@@ -83,6 +99,18 @@ module Sadr
             when "textDocument/definition" then {}
             when "textDocument/codeAction", "textDocument/codeLens", "textDocument/inlayHint" then [1]
             when "textDocument/diagnostic" then {}
+            else result
+            end
+          end
+          if ENV["SADR_INVALID_STRUCTURES"]
+            result = case message["method"]
+            when "textDocument/completion" then {items: [{label: "x"}]}
+            when "textDocument/hover" then {contents: {}}
+            when "textDocument/signatureHelp" then {signatures: [{}]}
+            when "textDocument/documentSymbol" then [{name: "x", kind: 13, range: range}]
+            when "workspace/symbol" then [{name: "x", kind: 13, location: {}}]
+            when "completionItem/resolve" then {}
+            when "textDocument/codeLens" then [{range: range, command: {title: "Run"}}]
             else result
             end
           end

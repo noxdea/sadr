@@ -242,7 +242,8 @@ module Sadr
           raise Error, "invalid workspace document version"
         end
         version = fetch(document, "version", nil)
-        raise Error, "invalid workspace document version" unless version.nil? || uint?(version)
+        valid_version = version.nil? || (version.is_a?(Integer) && version.between?(-0x80000000, 0x7fffffff))
+        raise Error, "invalid workspace document version" unless valid_version
         validate_text_edits(fetch(change, "edits"))
       else
         raise Error, "unknown workspace resource operation"

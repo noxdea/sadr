@@ -110,8 +110,8 @@ class ClientTest < Minitest::Test
       client.workspace_symbols("q").await
       assert_equal "x", client.resolve_completion("label" => "x").await["label"]
       assert_equal "quickfix", client.resolve_code_action("title" => "Fix", "kind" => "quickfix").await["kind"]
-      lens = {"range" => {"start" => {"line" => 0, "character" => 0}, "end" => {"line" => 0, "character" => 1}}, "command" => "lens"}
-      assert_equal "lens", client.resolve_code_lens(lens).await["command"]
+      lens = {"range" => {"start" => {"line" => 0, "character" => 0}, "end" => {"line" => 0, "character" => 1}}, "command" => {"title" => "Lens", "command" => "lens"}}
+      assert_equal "lens", client.resolve_code_lens(lens).await.dig("command", "command")
       assert_equal [1], client.execute_command("run", arguments: [1]).await["arguments"]
 
       messages = probe(client)
@@ -217,6 +217,72 @@ class ClientTest < Minitest::Test
     client&.stop
   end
 
+  def test_stop_cancels_a_restart_even_after_its_transport_is_created
+    entered = Queue.new
+    release = Queue.new
+    klass = Class.new(Sadr::Client) do
+      define_method(:build_transport) do |epoch|
+        value = super(epoch)
+        if state == :restarting
+          entered << value
+          release.pop
+        end
+        value
+      end
+    end
+    client = klass.new(command: Sadr::Testing::FakeServer.command, restart: true)
+    client.start(timeout: 3)
+    assert_raises(Sadr::Error) { client.request("crash").await }
+    wait_until { !entered.empty? }
+    restarted_transport = entered.pop
+
+    client.stop
+    release << true
+    restart = client.instance_variable_get(:@restart_thread)
+    assert restart.join(3), "restart did not observe cancellation"
+    assert_equal :stopped, client.state
+    refute client.running?
+    refute restarted_transport.alive?
+  ensure
+    release << true if release
+    client&.stop
+  end
+
+  def test_stop_prevents_a_queued_restart_from_creating_a_transport
+    entered = Queue.new
+    release = Queue.new
+    built = Queue.new
+    klass = Class.new(Sadr::Client) do
+      define_method(:connect) do |**options|
+        if options[:state] == :restarting
+          entered << true
+          release.pop
+        end
+        super(**options)
+      end
+      define_method(:build_transport) do |epoch|
+        built << true if state == :restarting
+        super(epoch)
+      end
+    end
+    client = klass.new(command: Sadr::Testing::FakeServer.command, restart: true)
+    client.start(timeout: 3)
+    assert_raises(Sadr::Error) { client.request("crash").await }
+    wait_until { !entered.empty? }
+    entered.pop
+
+    client.stop
+    release << true
+    restart = client.instance_variable_get(:@restart_thread)
+    assert restart.join(3), "restart did not observe cancellation"
+    assert built.empty?
+    assert_equal :stopped, client.state
+    refute client.running?
+  ensure
+    release << true if release
+    client&.stop
+  end
+
   def test_stale_semantic_response_cannot_repopulate_the_cache
     started = Queue.new
     with_client(env: {"SADR_SEMANTIC_DELAY" => "0.05"}) do |client|
@@ -244,6 +310,17 @@ class ClientTest < Minitest::Test
       messages = probe(client)
       assert_equal 2, messages.count { |message| message["method"] == "textDocument/semanticTokens/full" }
       assert_equal 0, messages.count { |message| message["method"] == "textDocument/semanticTokens/full/delta" }
+    end
+  end
+
+  def test_semantic_refresh_invalidates_before_asynchronous_dispatch
+    dispatches = Queue.new
+    dispatch = ->(&block) { dispatches << block }
+    with_client(env: {"SADR_SEMANTIC_REFRESH" => "1"}, dispatch: dispatch) do |client|
+      uri = client.open(document)
+      assert_equal [], client.semantic_tokens(uri, version: 0)
+      assert_equal 1, dispatches.length
+      assert_equal 1, client.semantic_tokens(uri, version: 0).first.length
     end
   end
 
@@ -291,6 +368,24 @@ class ClientTest < Minitest::Test
         -> { client.code_lens(uri) },
         -> { client.inlay_hint(uri, RANGE) },
         -> { client.diagnostic(uri) }
+      ]
+      requests.each { |request| assert_raises(Sadr::Error) { request.call.await } }
+      assert probe(client).is_a?(Array)
+      assert client.running?
+    end
+  end
+
+  def test_invalid_nested_wrapper_structures_fail_only_their_futures
+    with_client(env: {"SADR_INVALID_STRUCTURES" => "1"}) do |client|
+      uri = client.open(document)
+      requests = [
+        -> { client.completion(uri, POSITION) },
+        -> { client.hover(uri, POSITION) },
+        -> { client.signature_help(uri, POSITION) },
+        -> { client.document_symbol(uri) },
+        -> { client.workspace_symbols("q") },
+        -> { client.resolve_completion("label" => "x") },
+        -> { client.code_lens(uri) }
       ]
       requests.each { |request| assert_raises(Sadr::Error) { request.call.await } }
       assert probe(client).is_a?(Array)
