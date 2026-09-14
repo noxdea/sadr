@@ -914,17 +914,19 @@ module Sadr
     end
 
     def receive_diagnostics(params)
-      valid = params.is_a?(Hash) && params["uri"].is_a?(String) && params["diagnostics"].is_a?(Array)
+      valid = params.is_a?(Hash) && params["diagnostics"].is_a?(Array)
       raise Error, "invalid diagnostics notification" unless valid
 
+      uri = valid_uri(params["uri"])
       version = params["version"]
-      raise Error, "invalid diagnostic version" if !version.nil? && !version.is_a?(Integer)
+      valid_version = version.nil? || (version.is_a?(Integer) && version.between?(-0x80000000, 0x7fffffff))
+      raise Error, "invalid diagnostic version" unless valid_version
       diagnostics = Protocol.diagnostics(params["diagnostics"])
       @lock.synchronize do
-        document = @documents[params["uri"]]
+        document = @documents[uri]
         return if document && version && version < document.version
 
-        @diagnostics[params["uri"]] = diagnostics
+        @diagnostics[uri] = diagnostics
       end
     end
 
