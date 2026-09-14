@@ -30,6 +30,9 @@ completion = client.completion(document.uri, position).await
 client.stop
 ```
 
+`Future#await` waits without a deadline by default. Pass `timeout:` in seconds
+when the caller needs a bounded wait; expiry cancels the request best-effort.
+
 `Position#character` is measured in UTF-16 code units. Increment versions and
 send immutable changes when a document changes:
 

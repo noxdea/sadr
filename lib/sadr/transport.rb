@@ -3,10 +3,12 @@
 module Sadr
   class Transport
     MAX_MESSAGE = 32 << 20
+    MAX_TRY_FRAME = 512
+    private_constant :MAX_TRY_FRAME
 
     attr_reader :stderr_lines, :pid
 
-    def initialize(command, cwd: nil, env: {}, &receive)
+    def initialize(command, cwd: nil, env: {}, on_spawn: nil, &receive)
       valid = command.is_a?(Array) && !command.empty? && command.all? do |part|
         part.is_a?(String) && !part.include?("\0")
       end
@@ -14,14 +16,27 @@ module Sadr
       raise ArgumentError, "receiver required" unless receive
 
       options = cwd ? {chdir: cwd} : {}
-      @stdin, @stdout, @stderr, @process = Open3.popen3(env, *command, **options)
-      @stdin.binmode
-      @stdout.binmode
-      @pid = @process.pid
+      @close_lock = Mutex.new
+      @closing = false
+      @reader = @logger = nil
       @write_lock = Mutex.new
       @stderr_lines = []
-      @reader = Thread.new { read(receive) }
-      @logger = Thread.new { read_stderr }
+      @stdin, @stdout, @stderr, @process = Open3.popen3(env, *command, **options)
+      @pid = @process.pid
+      begin
+        on_spawn&.call(self)
+        @close_lock.synchronize do
+          raise Error, "language server connection was cancelled" if @closing
+
+          @stdin.binmode
+          @stdout.binmode
+          @reader = Thread.new { read(receive) }
+          @logger = Thread.new { read_stderr }
+        end
+      rescue StandardError
+        close
+        raise
+      end
     end
 
     def self.read_message(io)
@@ -89,29 +104,44 @@ module Sadr
     end
 
     def write(message)
-      raise Error, "expected JSON-RPC object" unless message.is_a?(Hash)
-
-      normalized = message.transform_keys(&:to_s)
-      normalized["error"] = normalized["error"].transform_keys(&:to_s) if normalized["error"].is_a?(Hash)
-      self.class.validate_message(normalized)
-      body = JSON.generate(message).b
-      raise Error, "oversized LSP message" unless body.bytesize.between?(1, MAX_MESSAGE)
+      frame = frame(message)
 
       @write_lock.synchronize do
-        @stdin.write("Content-Length: #{body.bytesize}\r\n\r\n")
-        @stdin.write(body)
+        @stdin.write(frame)
         @stdin.flush
       end
     rescue IOError, Errno::EPIPE => error
       raise Error, "language server write failed: #{error.message}"
     end
 
+    def try_write(message)
+      value = frame(message)
+      return false if value.bytesize > MAX_TRY_FRAME || !@write_lock.try_lock
+
+      begin
+        written = @stdin.write_nonblock(value, exception: false)
+        return false if written == :wait_writable
+        return true if written == value.bytesize
+
+        @stdin.close unless @stdin.closed?
+        false
+      rescue IOError, SystemCallError
+        false
+      ensure
+        @write_lock.unlock
+      end
+    end
+
     def alive? = @process.alive?
 
     def close
-      return if @closing
+      closing = @close_lock.synchronize do
+        next false if @closing
 
-      @closing = true
+        @closing = true
+      end
+      return unless closing
+
       @stdin.close unless @stdin.closed?
       unless @process.join(1)
         begin
@@ -129,7 +159,7 @@ module Sadr
         end
       end
       [@stdout, @stderr].each { |io| io.close unless io.closed? }
-      [@reader, @logger].each do |thread|
+      [@reader, @logger].compact.each do |thread|
         next if thread == Thread.current
 
         thread.kill unless thread.join(1)
@@ -137,6 +167,20 @@ module Sadr
     end
 
     private
+
+    def frame(message)
+      raise Error, "expected JSON-RPC object" unless message.is_a?(Hash)
+
+      normalized = message.transform_keys(&:to_s)
+      normalized["error"] = normalized["error"].transform_keys(&:to_s) if normalized["error"].is_a?(Hash)
+      self.class.validate_message(normalized)
+      body = JSON.generate(message).b
+      raise Error, "oversized LSP message" unless body.bytesize.between?(1, MAX_MESSAGE)
+
+      "Content-Length: #{body.bytesize}\r\n\r\n".b + body
+    rescue JSON::GeneratorError => error
+      raise Error, "invalid LSP JSON: #{error.message.byteslice(0, 256)}"
+    end
 
     def read(receive)
       loop do

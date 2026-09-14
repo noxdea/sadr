@@ -259,6 +259,53 @@ class ClientTest < Minitest::Test
     client&.stop
   end
 
+  def test_stop_tracks_a_spawned_transport_without_killing_the_start_caller
+    entered = Queue.new
+    release = Queue.new
+    result = Queue.new
+    existing_threads = Thread.list
+    client = Sadr::Client.new(command: Sadr::Testing::FakeServer.command, restart: false)
+    source, first_line = Sadr::Transport.instance_method(:initialize).source_location
+    lines = File.readlines(source)
+    spawn_line = ((first_line - 1)...lines.length).find { |index| lines[index].include?("on_spawn&.call") } + 1
+    target_line = spawn_line + 1
+    transport = nil
+    trace = TracePoint.new(:line) do |event|
+      next unless event.path == source && event.lineno == target_line
+
+      transport = event.self
+      entered << true
+      release.pop
+    end
+    trace.enable
+    starter = Thread.new do
+      client.start(timeout: 3)
+      result << nil
+    rescue StandardError => error
+      result << error
+    end
+    wait_until { !entered.empty? }
+    entered.pop
+
+    client.stop
+    assert starter.alive?, "stop killed its caller thread"
+    refute transport.alive?
+
+    release << true
+    assert starter.join(3), "start did not observe transport cancellation"
+    assert_instance_of Sadr::Error, result.pop
+    assert_equal :stopped, client.state
+    wait_until { (Thread.list - existing_threads).empty? }
+  ensure
+    trace&.disable
+    release << true if release
+    if starter && !starter.join(1)
+      starter.kill
+      starter.join(1)
+    end
+    client&.stop
+  end
+
   def test_running_stays_false_until_restart_reopens_every_document
     entered = Queue.new
     release = Queue.new
@@ -389,6 +436,47 @@ class ClientTest < Minitest::Test
     client&.stop
   end
 
+  def test_stale_transport_error_cannot_fail_a_replacement_connection
+    entered = Queue.new
+    release = Queue.new
+    client = Sadr::Client.new(command: Sadr::Testing::FakeServer.command, restart: false)
+    client.start(timeout: 3)
+    epoch = client.instance_variable_get(:@epoch)
+    source, first_line = Sadr::Client.instance_method(:receive).source_location
+    lines = File.readlines(source)
+    target_line = ((first_line - 1)...lines.length).find { |index| lines[index].include?("if error") } + 1
+    begin_receive = Queue.new
+    receiver = Thread.new do
+      begin_receive.pop
+      client.send(:receive, nil, Sadr::Error.new("stale transport"), epoch)
+    end
+    trace = TracePoint.new(:line) do |event|
+      next unless Thread.current == receiver && event.path == source && event.lineno == target_line
+
+      entered << true
+      release.pop
+    end
+    trace.enable
+    begin_receive << true
+    wait_until { !entered.empty? }
+    entered.pop
+
+    client.stop
+    client.start(timeout: 3)
+    release << true
+    assert receiver.join(3), "stale receiver remained blocked"
+    assert client.running?
+    assert probe(client).is_a?(Array)
+  ensure
+    trace&.disable
+    release << true if release
+    if receiver && !receiver.join(1)
+      receiver.kill
+      receiver.join(1)
+    end
+    client&.stop
+  end
+
   def test_stale_semantic_response_cannot_repopulate_the_cache
     started = Queue.new
     with_client(env: {"SADR_SEMANTIC_DELAY" => "0.05"}) do |client|
@@ -404,6 +492,28 @@ class ClientTest < Minitest::Test
       messages = probe(client)
       assert_equal 2, messages.count { |message| message["method"] == "textDocument/semanticTokens/full" }
       assert_equal 0, messages.count { |message| message["method"] == "textDocument/semanticTokens/full/delta" }
+    end
+  end
+
+  def test_only_the_latest_concurrent_semantic_request_updates_the_cache
+    started = Queue.new
+    first = nil
+    with_client(env: {"SADR_SEMANTIC_REVERSE" => "1"}) do |client|
+      client.on("semantic_started") { started << true }
+      uri = client.open(document)
+      first = Thread.new { client.semantic_tokens(uri, version: 0) }
+      wait_until { !started.empty? }
+      started.pop
+
+      latest = client.semantic_tokens(uri, version: 0)
+      assert first.join(3), "older semantic request remained blocked"
+      assert_equal [], first.value
+      assert_equal 2, latest.first.length
+    end
+  ensure
+    if first && !first.join(1)
+      first.kill
+      first.join(1)
     end
   end
 
@@ -468,6 +578,69 @@ class ClientTest < Minitest::Test
       assert request.join(3), "request write did not unblock after transport close"
       refute writer.closed.empty?
       wait_until { (Thread.list - existing_threads).empty? }
+    end
+  end
+
+  def test_timeout_and_public_cancel_do_not_wait_for_a_blocked_writer
+    blocked = nil
+    with_client do |client|
+      timed = client.request("never")
+      cancelled = client.request("never")
+      transport = client.transport
+      writer = BlockingWriter.new(transport.instance_variable_get(:@stdin))
+      transport.instance_variable_set(:@stdin, writer)
+      blocked = Thread.new do
+        client.request("probe")
+      rescue Sadr::Error
+        nil
+      end
+      wait_until { !writer.entered.empty? }
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      assert_raises(Sadr::Timeout) { timed.await(timeout: 0.01) }
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.5
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      assert cancelled.cancel
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 0.5
+
+      client.stop
+      assert blocked.join(3), "blocked writer did not stop"
+    end
+  ensure
+    if blocked && !blocked.join(1)
+      blocked.kill
+      blocked.join(1)
+    end
+  end
+
+  def test_invalid_utf8_inputs_do_not_mutate_document_state
+    invalid = "\xFF".b
+    with_client do |client|
+      assert_raises(Sadr::Error) { client.open(document(text: invalid)) }
+      assert_raises(Sadr::Error) do
+        client.open(Sadr::Document.new(uri: document.uri, language_id: invalid, version: 0, text: "x"))
+      end
+      assert_raises(Sadr::Error) do
+        client.open(Sadr::Document.new(uri: invalid, language_id: "ruby", version: 0, text: "x"))
+      end
+
+      base = document(text: "abc".b)
+      binary = Sadr::Document.new(uri: base.uri.b, language_id: base.language_id.b, version: base.version, text: base.text)
+      uri = client.open(binary)
+      assert_equal Encoding::UTF_8, uri.encoding
+      assert_raises(Sadr::Error) { client.change(uri, 1, [Sadr::ContentChange.new(range: nil, text: invalid)]) }
+      assert_raises(Sadr::Error) { client.save(uri, text: invalid) }
+      assert_raises(Sadr::Error) { client.rename(uri, POSITION, invalid) }
+      assert_raises(Sadr::Error) { client.request("invalid", value: invalid).await }
+      assert_raises(Sadr::Error) { client.notify("invalid", value: invalid) }
+      updated = client.change(uri, 1, [Sadr::ContentChange.new(range: nil, text: "next".b)])
+      assert_equal Encoding::UTF_8, updated.text.encoding
+      assert_equal "next", updated.text
+
+      messages = probe(client)
+      assert_equal 1, messages.count { |message| message["method"] == "textDocument/didOpen" }
+      assert_equal 1, messages.count { |message| message["method"] == "textDocument/didChange" }
+      refute messages.any? { |message| message["method"] == "textDocument/didSave" || message["method"] == "textDocument/rename" }
     end
   end
 

@@ -111,10 +111,11 @@ module Sadr
     MAX_MESSAGE: Integer
     attr_reader stderr_lines: Array[String]
     attr_reader pid: Integer
-    def initialize: (Array[String] command, ?cwd: String?, ?env: Hash[String, String?]) { (Hash[String, json]?, Exception?) -> untyped } -> void
+    def initialize: (Array[String] command, ?cwd: String?, ?env: Hash[String, String?], ?on_spawn: ^(Transport) -> untyped) { (Hash[String, json]?, Exception?) -> untyped } -> void
     def self.read_message: (IO | StringIO io) -> Hash[String, json]?
     def self.validate_message: (untyped message) -> Hash[String, json]
     def write: (object message) -> untyped
+    def try_write: (object message) -> bool
     def alive?: () -> bool
     def close: () -> untyped
   end
