@@ -168,6 +168,11 @@ module Sadr
     def resolve_completion: (object item) -> Future
     def resolve_code_action: (object action) -> Future
     def resolve_code_lens: (object lens) -> Future
+    def resolve_document_link: (object link) -> Future
+    def call_hierarchy_incoming_calls: (object item) -> Future
+    def call_hierarchy_outgoing_calls: (object item) -> Future
+    def type_hierarchy_supertypes: (object item) -> Future
+    def type_hierarchy_subtypes: (object item) -> Future
     def execute_command: (String command, ?arguments: Array[json]) -> Future
     def did_change_configuration: (json settings) -> untyped
     def did_change_watched_files: (Array[object] events) -> untyped
