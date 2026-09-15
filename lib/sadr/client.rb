@@ -39,6 +39,8 @@ module Sadr
       "documentLink" => :document_links,
       "diagnostic" => :diagnostic
     }.freeze
+    RESPONSE_ITEM_LIMIT = 10_000
+    private_constant :RESPONSE_ITEM_LIMIT
 
     attr_reader :capabilities, :transport, :diagnostics, :state, :errors, :server_info, :position_encoding
 
@@ -370,6 +372,18 @@ module Sadr
     def resolve_code_action(action) = resolve("codeAction/resolve", action, :code_action)
     def resolve_code_lens(lens) = resolve("codeLens/resolve", lens, :code_lens)
 
+    def resolve_document_link(link)
+      link = json_snapshot(link, "document link must be JSON")
+      raise Error, "invalid document link" unless valid_document_link?(link)
+
+      checked_request("documentLink/resolve", link, :document_link)
+    end
+
+    def call_hierarchy_incoming_calls(item) = hierarchy_request("callHierarchy/incomingCalls", item, :incoming_calls)
+    def call_hierarchy_outgoing_calls(item) = hierarchy_request("callHierarchy/outgoingCalls", item, :outgoing_calls)
+    def type_hierarchy_supertypes(item) = hierarchy_request("typeHierarchy/supertypes", item, :hierarchy_items)
+    def type_hierarchy_subtypes(item) = hierarchy_request("typeHierarchy/subtypes", item, :hierarchy_items)
+
     def execute_command(command, arguments: [])
       command = utf8_string(command, "command must be a nonempty valid UTF-8 String")
       raise Error, "command must be a nonempty valid UTF-8 String" if command.empty?
@@ -406,8 +420,8 @@ module Sadr
       future
     end
 
-    def checked_request(method, params, kind, **options)
-      send_request(method, params, ->(value) { validate_response(kind, value) }, **options)
+    def checked_request(method, params, kind, within: nil, **options)
+      send_request(method, params, ->(value) { validate_response(kind, value, within: within) }, **options)
     end
 
     def send_notification(method, params, state: :running, epoch: nil, transport: nil, allow_closing: false)
@@ -512,7 +526,7 @@ module Sadr
       future&.fulfill(error: error)
     end
 
-    def validate_response(kind, value)
+    def validate_response(kind, value, within: nil)
       case kind
       when :initialize
         valid = value.is_a?(Hash) && value["capabilities"].is_a?(Hash)
@@ -531,7 +545,14 @@ module Sadr
       when :document_highlights
         valid = value.nil? || (value.is_a?(Array) && value.all? { |highlight| valid_document_highlight?(highlight) })
       when :hierarchy_items
-        valid = value.nil? || (value.is_a?(Array) && value.all? { |item| valid_hierarchy_item?(item) })
+        valid = value.nil? || (value.is_a?(Array) && value.length <= RESPONSE_ITEM_LIMIT &&
+          value.all? { |item| valid_hierarchy_item?(item) })
+      when :incoming_calls
+        valid = value.nil? || (value.is_a?(Array) && value.length <= RESPONSE_ITEM_LIMIT &&
+          value.all? { |call| valid_incoming_call?(call) })
+      when :outgoing_calls
+        valid = value.nil? || (value.is_a?(Array) && value.length <= RESPONSE_ITEM_LIMIT &&
+          value.all? { |call| valid_outgoing_call?(call, within: within) })
       when :linked_editing_ranges
         valid = valid_linked_editing_ranges?(value)
       when :completion
@@ -568,7 +589,10 @@ module Sadr
       when :folding_ranges
         valid = value.nil? || (value.is_a?(Array) && value.all? { |range| valid_folding_range?(range) })
       when :document_links
-        valid = value.nil? || (value.is_a?(Array) && value.all? { |link| valid_document_link?(link) })
+        valid = value.nil? || (value.is_a?(Array) && value.length <= RESPONSE_ITEM_LIMIT &&
+          value.all? { |link| valid_document_link?(link) })
+      when :document_link
+        valid = valid_document_link?(value)
       when :diagnostic
         valid = value.nil? || valid_diagnostic_report?(value)
       when :semantic
@@ -729,6 +753,8 @@ module Sadr
       return false if item.key?("detail") && !item["detail"].is_a?(String)
       return false if item.key?("tags") && !(item["tags"].is_a?(Array) && item["tags"].all? { |tag| tag == 1 })
 
+      json_snapshot(item["data"], "invalid LSP response") if item.key?("data")
+
       true
     rescue Error, KeyError
       false
@@ -786,6 +812,8 @@ module Sadr
       valid_uri(link["target"]) if link.key?("target")
       return false if link.key?("tooltip") && !link["tooltip"].is_a?(String)
 
+      json_snapshot(link["data"], "invalid LSP response") if link.key?("data")
+
       true
     rescue Error, KeyError
       false
@@ -794,6 +822,25 @@ module Sadr
     def range_contains_position?(range, position)
       range = Protocol.range_value(range)
       position_before_or_equal?(range.start, position) && position_before_or_equal?(position, range.end)
+    end
+
+    def valid_incoming_call?(call)
+      return false unless call.is_a?(Hash) && valid_hierarchy_item?(call["from"])
+
+      valid_ranges?(call["fromRanges"], within: call["from"]["range"])
+    end
+
+    def valid_outgoing_call?(call, within: nil)
+      call.is_a?(Hash) && valid_hierarchy_item?(call["to"]) && valid_ranges?(call["fromRanges"], within: within)
+    end
+
+    def valid_ranges?(values, within: nil)
+      return false unless values.is_a?(Array) && values.length <= RESPONSE_ITEM_LIMIT
+
+      ranges = values.map { |range| Protocol.range_value(range) }
+      !within || ranges.all? { |range| range_contains_range?(within, range) }
+    rescue Error, KeyError
+      false
     end
 
     def range_contains_range?(outer, inner)
@@ -1018,7 +1065,7 @@ module Sadr
           raise Error, message
         end
       end
-      JSON.parse(JSON.generate(value))
+      JSON.parse(JSON.generate(value), freeze: true)
     rescue JSON::JSONError, EncodingError, RuntimeError
       raise Error, message
     end
@@ -1039,6 +1086,13 @@ module Sadr
 
     def request_document(method, uri, **params)
       checked_request("textDocument/#{method}", params.merge(textDocument: {uri: valid_uri(uri)}), RESPONSE_KINDS.fetch(method))
+    end
+
+    def hierarchy_request(method, item, kind)
+      item = json_snapshot(item, "hierarchy item must be JSON")
+      raise Error, "invalid hierarchy item" unless valid_hierarchy_item?(item)
+
+      checked_request(method, {item: item}, kind, within: item["range"])
     end
 
     def resolve(method, value, kind)

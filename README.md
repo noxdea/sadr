@@ -44,6 +44,24 @@ formatted = client.range_formatting(document.uri, range,
   tabSize: 2, insertSpaces: true).await
 ```
 
+Prepared hierarchy items can be followed in either direction. Document links
+can likewise be resolved after discovery. Sadr validates the supplied item and
+every returned item, call range, URI, and opaque JSON `data` value before
+crossing the client boundary:
+
+```ruby
+call_item = client.prepare_call_hierarchy(document.uri, position).await&.first
+incoming = client.call_hierarchy_incoming_calls(call_item).await if call_item
+outgoing = client.call_hierarchy_outgoing_calls(call_item).await if call_item
+
+type_item = client.prepare_type_hierarchy(document.uri, position).await&.first
+supertypes = client.type_hierarchy_supertypes(type_item).await if type_item
+subtypes = client.type_hierarchy_subtypes(type_item).await if type_item
+
+link = client.document_link(document.uri).await&.first
+resolved_link = client.resolve_document_link(link).await if link
+```
+
 Workspace changes are notifications and return after the transport accepts the
 message:
 
