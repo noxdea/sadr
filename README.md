@@ -53,6 +53,8 @@ client.did_change_watched_files([{uri: document.uri, type: 2}])
 ```
 
 Watched-file types follow LSP: `1` created, `2` changed, and `3` deleted.
+Configuration settings may be any JSON value, as required by LSP. Sadr snapshots
+them before sending so later caller mutations do not alter configuration replies.
 
 `Future#await` waits without a deadline by default. Pass `timeout:` in seconds
 when the caller needs a bounded wait; expiry cancels the request best-effort.
