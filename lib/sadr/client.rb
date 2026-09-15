@@ -8,7 +8,12 @@ module Sadr
       definition: "definition",
       type_definition: "typeDefinition",
       implementation: "implementation",
-      signature_help: "signatureHelp"
+      signature_help: "signatureHelp",
+      prepare_rename: "prepareRename",
+      document_highlight: "documentHighlight",
+      prepare_call_hierarchy: "prepareCallHierarchy",
+      prepare_type_hierarchy: "prepareTypeHierarchy",
+      linked_editing_range: "linkedEditingRange"
     }.freeze
     RESPONSE_KINDS = {
       "completion" => :completion,
@@ -18,12 +23,20 @@ module Sadr
       "implementation" => :locations,
       "references" => :locations,
       "rename" => :workspace_edit,
+      "prepareRename" => :prepare_rename,
+      "documentHighlight" => :document_highlights,
+      "prepareCallHierarchy" => :hierarchy_items,
+      "prepareTypeHierarchy" => :hierarchy_items,
+      "linkedEditingRange" => :linked_editing_ranges,
       "signatureHelp" => :signature_help,
       "documentSymbol" => :document_symbols,
       "formatting" => :text_edits,
+      "rangeFormatting" => :text_edits,
       "codeAction" => :code_actions,
       "codeLens" => :code_lenses,
       "inlayHint" => :inlay_hints,
+      "foldingRange" => :folding_ranges,
+      "documentLink" => :document_links,
       "diagnostic" => :diagnostic
     }.freeze
 
@@ -253,6 +266,12 @@ module Sadr
       request_document("formatting", uri, options: options)
     end
 
+    def range_formatting(uri, range, options)
+      raise Error, "formatting options must be an object" unless options.is_a?(Hash)
+
+      request_document("rangeFormatting", uri, range: Protocol.range_hash(range), options: options)
+    end
+
     def code_action(uri, range, context)
       raise Error, "code action context must be an object" unless context.is_a?(Hash)
 
@@ -261,6 +280,46 @@ module Sadr
 
     def code_lens(uri) = request_document("codeLens", uri)
     def inlay_hint(uri, range) = request_document("inlayHint", uri, range: Protocol.range_hash(range))
+    def folding_range(uri) = request_document("foldingRange", uri)
+    def document_link(uri) = request_document("documentLink", uri)
+
+    def selection_range(uri, positions)
+      raise Error, "positions must be an Array" unless positions.is_a?(Array)
+
+      expected_count = positions.length
+      params = {textDocument: {uri: valid_uri(uri)}, positions: positions.map { |position| Protocol.position_hash(position) }}
+      send_request("textDocument/selectionRange", params, lambda do |value|
+        validate_response(:selection_ranges, value)
+        raise Error, "invalid LSP response" unless value.length == expected_count
+
+        value
+      end)
+    end
+
+    def did_change_configuration(settings)
+      raise Error, "settings must be an object" unless settings.is_a?(Hash)
+
+      @lock.synchronize do
+        ensure_running!
+        @configuration = settings
+      end
+      notify("workspace/didChangeConfiguration", settings: settings)
+    end
+
+    def did_change_watched_files(events)
+      raise Error, "file events must be an Array" unless events.is_a?(Array)
+
+      values = events.map do |event|
+        raise Error, "invalid file event" unless event.is_a?(Hash)
+
+        uri = event.key?(:uri) ? event[:uri] : event["uri"]
+        type = event.key?(:type) ? event[:type] : event["type"]
+        raise Error, "invalid file event" unless type.is_a?(Integer) && type.between?(1, 3)
+
+        {uri: valid_uri(uri), type: type}
+      end
+      notify("workspace/didChangeWatchedFiles", changes: values)
+    end
 
     def diagnostic(uri, previous_result_id: nil)
       params = {}
@@ -468,6 +527,14 @@ module Sadr
         valid = valid_workspace_symbols?(value)
       when :locations
         valid = value.nil? || valid_locations?(value)
+      when :prepare_rename
+        valid = valid_prepare_rename?(value)
+      when :document_highlights
+        valid = value.nil? || (value.is_a?(Array) && value.all? { |highlight| valid_document_highlight?(highlight) })
+      when :hierarchy_items
+        valid = value.nil? || (value.is_a?(Array) && value.all? { |item| valid_hierarchy_item?(item) })
+      when :linked_editing_ranges
+        valid = valid_linked_editing_ranges?(value)
       when :completion
         valid = valid_completion?(value)
       when :completion_item
@@ -499,6 +566,12 @@ module Sadr
       when :inlay_hints
         valid = value.nil? || value.is_a?(Array)
         value&.each { |hint| validate_inlay_hint(hint) }
+      when :folding_ranges
+        valid = value.nil? || (value.is_a?(Array) && value.all? { |range| valid_folding_range?(range) })
+      when :selection_ranges
+        valid = value.is_a?(Array) && value.all? { |range| valid_selection_range?(range) }
+      when :document_links
+        valid = value.nil? || (value.is_a?(Array) && value.all? { |link| valid_document_link?(link) })
       when :diagnostic
         valid = value.nil? || valid_diagnostic_report?(value)
       when :semantic
@@ -618,6 +691,88 @@ module Sadr
       locations.all? { |location| valid_location?(location) || valid_location_link?(location) }
     end
 
+    def valid_prepare_rename?(value)
+      return true if value.nil?
+
+      if value.is_a?(Hash) && (value.key?("defaultBehavior") || value.key?(:defaultBehavior))
+        return (value["defaultBehavior"] || value[:defaultBehavior]) == true
+      end
+
+      range = value.is_a?(Hash) && (value.key?("range") || value.key?(:range)) ? value["range"] || value[:range] : value
+      Protocol.range_value(range)
+      !value.is_a?(Hash) || !value.key?("placeholder") || value["placeholder"].is_a?(String)
+    rescue Error, KeyError
+      false
+    end
+
+    def valid_document_highlight?(highlight)
+      return false unless highlight.is_a?(Hash)
+
+      Protocol.range_value(highlight.fetch("range"))
+      !highlight.key?("kind") || (highlight["kind"].is_a?(Integer) && highlight["kind"].between?(1, 3))
+    rescue Error, KeyError
+      false
+    end
+
+    def valid_hierarchy_item?(item)
+      return false unless valid_symbol?(item) && item["uri"].is_a?(String)
+
+      valid_uri(item["uri"])
+      Protocol.range_value(item.fetch("range"))
+      Protocol.range_value(item.fetch("selectionRange"))
+      return false if item.key?("detail") && !item["detail"].is_a?(String)
+      return false if item.key?("tags") && !(item["tags"].is_a?(Array) && item["tags"].all? { |tag| tag == 1 })
+
+      true
+    rescue Error, KeyError
+      false
+    end
+
+    def valid_linked_editing_ranges?(value)
+      return true if value.nil?
+      return false unless value.is_a?(Hash) && value["ranges"].is_a?(Array) && !value["ranges"].empty?
+      return false if value.key?("wordPattern") && !value["wordPattern"].is_a?(String)
+
+      value["ranges"].each { |range| Protocol.range_value(range) }
+      true
+    rescue Error
+      false
+    end
+
+    def valid_folding_range?(range)
+      return false unless range.is_a?(Hash)
+
+      first = range["startLine"]
+      last = range["endLine"]
+      return false unless Protocol.uint?(first) && Protocol.uint?(last) && first <= last
+      return false unless optional_uint?(range, "startCharacter") && optional_uint?(range, "endCharacter")
+      return false if range.key?("kind") && !range["kind"].is_a?(String)
+      return false if range.key?("collapsedText") && !range["collapsedText"].is_a?(String)
+
+      first != last || !range.key?("startCharacter") || !range.key?("endCharacter") || range["startCharacter"] <= range["endCharacter"]
+    end
+
+    def valid_selection_range?(selection, depth = 0)
+      return false unless selection.is_a?(Hash) && depth < 256
+
+      Protocol.range_value(selection.fetch("range"))
+      !selection.key?("parent") || valid_selection_range?(selection["parent"], depth + 1)
+    rescue Error, KeyError, SystemStackError
+      false
+    end
+
+    def valid_document_link?(link)
+      return false unless link.is_a?(Hash)
+
+      Protocol.range_value(link.fetch("range"))
+      valid_uri(link["target"]) if link.key?("target") && !link["target"].nil?
+      return false if link.key?("tooltip") && !link["tooltip"].is_a?(String)
+
+      true
+    rescue Error, KeyError
+      false
+    end
+
     def valid_location?(location)
       return false unless location.is_a?(Hash) && location.key?("uri")
 
@@ -712,6 +867,16 @@ module Sadr
             hover: {contentFormat: %w[markdown plaintext]},
             signatureHelp: {signatureInformation: {documentationFormat: %w[markdown plaintext], parameterInformation: {labelOffsetSupport: true}}},
             documentSymbol: {hierarchicalDocumentSymbolSupport: true},
+            documentHighlight: {dynamicRegistration: false},
+            foldingRange: {dynamicRegistration: false, lineFoldingOnly: false},
+            selectionRange: {dynamicRegistration: false},
+            rename: {dynamicRegistration: false, prepareSupport: true},
+            callHierarchy: {dynamicRegistration: false},
+            typeHierarchy: {dynamicRegistration: false},
+            documentLink: {dynamicRegistration: false, tooltipSupport: true},
+            linkedEditingRange: {dynamicRegistration: false},
+            formatting: {dynamicRegistration: false},
+            rangeFormatting: {dynamicRegistration: false},
             codeAction: {codeActionLiteralSupport: {codeActionKind: {valueSet: %w[quickfix refactor refactor.extract refactor.inline refactor.rewrite source source.organizeImports]}}, resolveSupport: {properties: ["edit"]}},
             publishDiagnostics: {relatedInformation: true, versionSupport: true},
             diagnostic: {dynamicRegistration: false, relatedDocumentSupport: false},
@@ -719,7 +884,9 @@ module Sadr
             codeLens: {dynamicRegistration: false},
             semanticTokens: {requests: {full: {delta: true}}, tokenTypes: %w[namespace type class enum interface struct typeParameter parameter variable property enumMember event function method macro keyword modifier comment string number regexp operator decorator], tokenModifiers: %w[declaration definition readonly static deprecated abstract async modification documentation defaultLibrary], formats: ["relative"], overlappingTokenSupport: false, multilineTokenSupport: false}
           },
-          workspace: {applyEdit: true, configuration: true, workspaceFolders: true, workspaceEdit: {documentChanges: true, resourceOperations: %w[create rename delete], failureHandling: "abort"}}
+          workspace: {applyEdit: true, configuration: true, workspaceFolders: true,
+            didChangeConfiguration: {dynamicRegistration: false}, didChangeWatchedFiles: {dynamicRegistration: false},
+            workspaceEdit: {documentChanges: true, resourceOperations: %w[create rename delete], failureHandling: "abort"}}
         }
       }
     end

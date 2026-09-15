@@ -148,11 +148,20 @@ module Sadr
     def references: (String uri, Position position, ?include_declaration: bool) -> Future
     def signature_help: (String uri, Position position, **json params) -> Future
     def rename: (String uri, Position position, String new_name) -> Future
+    def prepare_rename: (String uri, Position position, **json params) -> Future
+    def document_highlight: (String uri, Position position, **json params) -> Future
+    def prepare_call_hierarchy: (String uri, Position position, **json params) -> Future
+    def prepare_type_hierarchy: (String uri, Position position, **json params) -> Future
+    def linked_editing_range: (String uri, Position position, **json params) -> Future
     def document_symbol: (String uri) -> Future
     def formatting: (String uri, object options) -> Future
+    def range_formatting: (String uri, Range_ range, object options) -> Future
     def code_action: (String uri, Range_ range, object context) -> Future
     def code_lens: (String uri) -> Future
     def inlay_hint: (String uri, Range_ range) -> Future
+    def folding_range: (String uri) -> Future
+    def selection_range: (String uri, Array[Position | Hash[String | Symbol, Integer]] positions) -> Future
+    def document_link: (String uri) -> Future
     def diagnostic: (String uri, ?previous_result_id: String?) -> Future
     def semantic_tokens: (String uri, version: Integer) -> Array[Token]
     def workspace_symbols: (String query) -> Future
@@ -160,6 +169,8 @@ module Sadr
     def resolve_code_action: (object action) -> Future
     def resolve_code_lens: (object lens) -> Future
     def execute_command: (String command, ?arguments: Array[json]) -> Future
+    def did_change_configuration: (object settings) -> untyped
+    def did_change_watched_files: (Array[object] events) -> untyped
   end
 
   module Testing
