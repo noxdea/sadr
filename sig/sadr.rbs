@@ -128,7 +128,7 @@ module Sadr
     attr_reader errors: Array[Error]
     attr_reader server_info: Hash[String, json]?
     attr_reader position_encoding: String?
-    def initialize: (command: Array[String], ?root: String, ?dispatch: ^() { () -> untyped } -> untyped, ?restart: bool, ?env: Hash[String, String?], ?initialization_options: json, ?configuration: object) -> void
+    def initialize: (command: Array[String], ?root: String, ?dispatch: ^() { () -> untyped } -> untyped, ?restart: bool, ?env: Hash[String, String?], ?initialization_options: json, ?configuration: json) -> void
     def start: (?timeout: Numeric) -> Hash[String, json]
     def stop: () -> untyped
     def running?: () -> bool
@@ -169,7 +169,7 @@ module Sadr
     def resolve_code_action: (object action) -> Future
     def resolve_code_lens: (object lens) -> Future
     def execute_command: (String command, ?arguments: Array[json]) -> Future
-    def did_change_configuration: (object settings) -> untyped
+    def did_change_configuration: (json settings) -> untyped
     def did_change_watched_files: (Array[object] events) -> untyped
   end
 

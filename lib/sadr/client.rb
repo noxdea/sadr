@@ -49,7 +49,7 @@ module Sadr
       @restart = restart
       @env = env
       @initialization_options = initialization_options
-      @configuration = configuration
+      @configuration = json_snapshot(configuration, "configuration must be JSON")
       @pending = {}
       @handlers = {}
       @documents = {}
@@ -59,6 +59,7 @@ module Sadr
       @sequence = 0
       @lock = Mutex.new
       @document_lock = Mutex.new
+      @configuration_lock = Mutex.new
       @connecting_transport = nil
       @state = :stopped
       @restarts = 0
@@ -267,9 +268,7 @@ module Sadr
     end
 
     def range_formatting(uri, range, options)
-      raise Error, "formatting options must be an object" unless options.is_a?(Hash)
-
-      request_document("rangeFormatting", uri, range: Protocol.range_hash(range), options: options)
+      request_document("rangeFormatting", uri, range: Protocol.range_hash(range), options: formatting_options(options))
     end
 
     def code_action(uri, range, context)
@@ -286,24 +285,24 @@ module Sadr
     def selection_range(uri, positions)
       raise Error, "positions must be an Array" unless positions.is_a?(Array)
 
-      expected_count = positions.length
-      params = {textDocument: {uri: valid_uri(uri)}, positions: positions.map { |position| Protocol.position_hash(position) }}
+      wire_positions = positions.map { |position| Protocol.position_hash(position) }
+      params = {textDocument: {uri: valid_uri(uri)}, positions: wire_positions}
       send_request("textDocument/selectionRange", params, lambda do |value|
-        validate_response(:selection_ranges, value)
-        raise Error, "invalid LSP response" unless value.length == expected_count
+        raise Error, "invalid LSP response" unless valid_selection_ranges?(value, wire_positions)
 
         value
       end)
     end
 
     def did_change_configuration(settings)
-      raise Error, "settings must be an object" unless settings.is_a?(Hash)
-
-      @lock.synchronize do
-        ensure_running!
-        @configuration = settings
+      settings = json_snapshot(settings, "settings must be JSON")
+      @configuration_lock.synchronize do
+        @lock.synchronize do
+          ensure_running!
+          @configuration = settings
+        end
+        notify("workspace/didChangeConfiguration", settings: settings)
       end
-      notify("workspace/didChangeConfiguration", settings: settings)
     end
 
     def did_change_watched_files(events)
@@ -568,8 +567,6 @@ module Sadr
         value&.each { |hint| validate_inlay_hint(hint) }
       when :folding_ranges
         valid = value.nil? || (value.is_a?(Array) && value.all? { |range| valid_folding_range?(range) })
-      when :selection_ranges
-        valid = value.is_a?(Array) && value.all? { |range| valid_selection_range?(range) }
       when :document_links
         valid = value.nil? || (value.is_a?(Array) && value.all? { |link| valid_document_link?(link) })
       when :diagnostic
@@ -695,12 +692,20 @@ module Sadr
       return true if value.nil?
 
       if value.is_a?(Hash) && (value.key?("defaultBehavior") || value.key?(:defaultBehavior))
-        return (value["defaultBehavior"] || value[:defaultBehavior]) == true
+        default_behavior = value.key?("defaultBehavior") ? value["defaultBehavior"] : value[:defaultBehavior]
+        return boolean?(default_behavior)
       end
 
-      range = value.is_a?(Hash) && (value.key?("range") || value.key?(:range)) ? value["range"] || value[:range] : value
-      Protocol.range_value(range)
-      !value.is_a?(Hash) || !value.key?("placeholder") || value["placeholder"].is_a?(String)
+      if value.is_a?(Hash) && (value.key?("range") || value.key?(:range))
+        range = value["range"] || value[:range]
+        placeholder = value.key?("placeholder") ? value["placeholder"] : value[:placeholder]
+        return false unless placeholder.is_a?(String)
+
+        Protocol.range_value(range)
+      else
+        Protocol.range_value(value)
+      end
+      true
     rescue Error, KeyError
       false
     end
@@ -718,8 +723,9 @@ module Sadr
       return false unless valid_symbol?(item) && item["uri"].is_a?(String)
 
       valid_uri(item["uri"])
-      Protocol.range_value(item.fetch("range"))
-      Protocol.range_value(item.fetch("selectionRange"))
+      range = Protocol.range_value(item.fetch("range"))
+      selection_range = Protocol.range_value(item.fetch("selectionRange"))
+      return false unless range_contains_range?(range, selection_range)
       return false if item.key?("detail") && !item["detail"].is_a?(String)
       return false if item.key?("tags") && !(item["tags"].is_a?(Array) && item["tags"].all? { |tag| tag == 1 })
 
@@ -730,11 +736,12 @@ module Sadr
 
     def valid_linked_editing_ranges?(value)
       return true if value.nil?
-      return false unless value.is_a?(Hash) && value["ranges"].is_a?(Array) && !value["ranges"].empty?
+      return false unless value.is_a?(Hash) && value["ranges"].is_a?(Array)
       return false if value.key?("wordPattern") && !value["wordPattern"].is_a?(String)
 
-      value["ranges"].each { |range| Protocol.range_value(range) }
-      true
+      ranges = value["ranges"].map { |range| Protocol.range_value(range) }
+      ranges.sort_by! { |range| position_tuple(range.start) }
+      ranges.each_cons(2).all? { |first, last| position_before_or_equal?(first.end, last.start) }
     rescue Error
       false
     end
@@ -752,12 +759,23 @@ module Sadr
       first != last || !range.key?("startCharacter") || !range.key?("endCharacter") || range["startCharacter"] <= range["endCharacter"]
     end
 
-    def valid_selection_range?(selection, depth = 0)
-      return false unless selection.is_a?(Hash) && depth < 256
+    def valid_selection_ranges?(value, positions)
+      return true if value.nil?
+      return false unless value.is_a?(Array) && value.length == positions.length
 
-      Protocol.range_value(selection.fetch("range"))
-      !selection.key?("parent") || valid_selection_range?(selection["parent"], depth + 1)
-    rescue Error, KeyError, SystemStackError
+      pending = value.each_index.map { |index| [value[index], positions[index], nil, 0] }
+      until pending.empty?
+        selection, position, child_range, depth = pending.pop
+        return false unless selection.is_a?(Hash) && depth < 256
+
+        range = Protocol.range_value(selection.fetch("range"))
+        return false unless range_contains_position?(range, position)
+        return false if child_range && !range_contains_range?(range, child_range)
+
+        pending << [selection["parent"], position, range, depth + 1] if selection.key?("parent")
+      end
+      true
+    rescue Error, KeyError
       false
     end
 
@@ -765,12 +783,32 @@ module Sadr
       return false unless link.is_a?(Hash)
 
       Protocol.range_value(link.fetch("range"))
-      valid_uri(link["target"]) if link.key?("target") && !link["target"].nil?
+      valid_uri(link["target"]) if link.key?("target")
       return false if link.key?("tooltip") && !link["tooltip"].is_a?(String)
 
       true
     rescue Error, KeyError
       false
+    end
+
+    def range_contains_position?(range, position)
+      range = Protocol.range_value(range)
+      position_before_or_equal?(range.start, position) && position_before_or_equal?(position, range.end)
+    end
+
+    def range_contains_range?(outer, inner)
+      outer = Protocol.range_value(outer)
+      inner = Protocol.range_value(inner)
+      position_before_or_equal?(outer.start, inner.start) && position_before_or_equal?(inner.end, outer.end)
+    end
+
+    def position_before_or_equal?(first, last)
+      (position_tuple(first) <=> position_tuple(last)) <= 0
+    end
+
+    def position_tuple(value)
+      value = Protocol.position_value(value)
+      [value.line, value.character]
     end
 
     def valid_location?(location)
@@ -935,6 +973,54 @@ module Sadr
       uri
     rescue URI::InvalidURIError
       raise Error, "invalid URI"
+    end
+
+    def formatting_options(value)
+      value = json_snapshot(value, "formatting options must be JSON")
+      valid = value.is_a?(Hash) && Protocol.uint?(value["tabSize"]) && boolean?(value["insertSpaces"])
+      valid &&= value.all? do |key, item|
+        %w[tabSize insertSpaces].include?(key) || boolean?(item) || item.is_a?(String) ||
+          (item.is_a?(Integer) && item.between?(-0x80000000, 0x7fffffff))
+      end
+      raise Error, "invalid formatting options" unless valid
+
+      value
+    end
+
+    def json_snapshot(value, message)
+      pending = [[value, 0]]
+      until pending.empty?
+        item, depth = pending.pop
+        case item
+        when NilClass, TrueClass, FalseClass
+          next
+        when Integer
+          raise Error, message unless item.between?(-0x80000000, 0x7fffffff)
+        when Float
+          raise Error, message unless item.finite?
+        when String
+          raise Error, message unless item.dup.force_encoding(Encoding::UTF_8).valid_encoding?
+        when Array
+          raise Error, message if depth >= 100
+
+          item.each { |child| pending << [child, depth + 1] }
+        when Hash
+          raise Error, message if depth >= 100
+          raise Error, message unless item.keys.all? { |key| key.is_a?(String) || key.is_a?(Symbol) }
+          raise Error, message unless item.keys.map(&:to_s).uniq.length == item.length
+
+          item.each_key do |key|
+            key = key.to_s
+            raise Error, message unless key.dup.force_encoding(Encoding::UTF_8).valid_encoding?
+          end
+          item.each_value { |child| pending << [child, depth + 1] }
+        else
+          raise Error, message
+        end
+      end
+      JSON.parse(JSON.generate(value))
+    rescue JSON::JSONError, EncodingError, RuntimeError
+      raise Error, message
     end
 
     def utf8_string(value, message)
@@ -1102,10 +1188,11 @@ module Sadr
       when "workspace/configuration"
         items = params.fetch("items")
         raise Error, "invalid configuration request" unless items.is_a?(Array)
+        configuration = @configuration_lock.synchronize { @configuration }
 
         [true, items.map do |item|
           section = item["section"]
-          section ? @configuration.dig(*section.split(".")) : @configuration
+          section && configuration.is_a?(Hash) ? configuration.dig(*section.split(".")) : (configuration unless section)
         end]
       when "workspace/workspaceFolders"
         [true, [{uri: Protocol.uri(@root), name: File.basename(@root)}]]
