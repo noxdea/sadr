@@ -30,6 +30,30 @@ completion = client.completion(document.uri, position).await
 client.stop
 ```
 
+Document highlights, folding and selection ranges, rename preparation,
+hierarchy preparation, document links, linked editing ranges, and range
+formatting use the same URI and UTF-16 position values:
+
+```ruby
+highlights = client.document_highlight(document.uri, position).await
+folds = client.folding_range(document.uri).await
+selection = client.selection_range(document.uri, [position]).await
+rename_range = client.prepare_rename(document.uri, position).await
+range = Sadr::Range_.new(start: position, end: position)
+formatted = client.range_formatting(document.uri, range,
+  tabSize: 2, insertSpaces: true).await
+```
+
+Workspace changes are notifications and return after the transport accepts the
+message:
+
+```ruby
+client.did_change_configuration("ruby" => {"lint" => true})
+client.did_change_watched_files([{uri: document.uri, type: 2}])
+```
+
+Watched-file types follow LSP: `1` created, `2` changed, and `3` deleted.
+
 `Future#await` waits without a deadline by default. Pass `timeout:` in seconds
 when the caller needs a bounded wait; expiry cancels the request best-effort.
 
