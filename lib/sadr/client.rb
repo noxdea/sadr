@@ -955,7 +955,7 @@ module Sadr
             documentHighlight: {dynamicRegistration: false},
             foldingRange: {dynamicRegistration: false, lineFoldingOnly: false},
             selectionRange: {dynamicRegistration: false},
-            rename: {dynamicRegistration: false, prepareSupport: true},
+            rename: {dynamicRegistration: false, prepareSupport: true, prepareSupportDefaultBehavior: 1},
             callHierarchy: {dynamicRegistration: false},
             typeHierarchy: {dynamicRegistration: false},
             documentLink: {dynamicRegistration: false, tooltipSupport: true},

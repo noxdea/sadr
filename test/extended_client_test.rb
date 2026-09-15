@@ -222,6 +222,7 @@ class ExtendedClientTest < Minitest::Test
       assert text.key?(name), "missing #{name} capability"
     end
     assert_equal true, text.dig("rename", "prepareSupport")
+    assert_equal 1, text.dig("rename", "prepareSupportDefaultBehavior")
     workspace = initialize.dig("params", "capabilities", "workspace")
     assert_equal false, workspace.dig("didChangeConfiguration", "dynamicRegistration")
     assert_equal false, workspace.dig("didChangeWatchedFiles", "dynamicRegistration")
