@@ -1,8 +1,38 @@
-# Sadr
+<h1 align="center">Sadr</h1>
+
+<p align="center">
+  <strong>Pure Ruby Language Server Protocol client</strong>
+</p>
+
+<p align="center">
+  <a href="https://rubygems.org/gems/sadr"><img src="https://img.shields.io/gem/v/sadr.svg?colorB=319e8c" alt="Gem Version"></a>
+  <a href="https://rubygems.org/gems/sadr"><img src="https://img.shields.io/gem/dt/sadr.svg" alt="Downloads"></a>
+  <img src="https://img.shields.io/badge/ruby-%3E%3D%203.1-ruby.svg" alt="Ruby Version">
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> ·
+  <a href="#installation">Installation</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#protocol-coverage">Protocol Coverage</a> ·
+  <a href="#testing">Testing</a>
+</p>
+
+---
 
 Sadr is a pure Ruby Language Server Protocol client. It owns JSON-RPC framing,
 server lifecycle, document synchronization, diagnostics, and semantic tokens
 without depending on an editor model or text-storage gem.
+
+## Features
+
+- JSON-RPC framing and Language Server Protocol lifecycle management
+- Document synchronization, diagnostics, semantic tokens, and workspace edits
+- Completion, navigation, hierarchy, formatting, rename, and link requests
+- UTF-16 position conversion through caller-owned text indexes
+- Cancellable, timeout-aware futures and automatic server recovery
+- In-memory and child-process testing helpers
 
 ## Installation
 
@@ -10,7 +40,9 @@ without depending on an editor model or text-storage gem.
 gem "sadr"
 ```
 
-## Usage
+Sadr supports Ruby 3.1 and later.
+
+## Quick Start
 
 ```ruby
 require "sadr"
@@ -29,6 +61,8 @@ position = Sadr::Position.new(line: 0, character: 0)
 completion = client.completion(document.uri, position).await
 client.stop
 ```
+
+## Protocol coverage
 
 Document highlights, folding and selection ranges, rename preparation,
 hierarchy preparation, document links, linked editing ranges, and range
@@ -95,6 +129,8 @@ position = Sadr::Protocol.position(my_text_index, byte_offset)
 edits = Sadr::Protocol.text_edits(my_text_index, server_edits)
 ```
 
+## Testing
+
 Tests can use the bundled child-process server or the in-memory transport:
 
 ```ruby
@@ -123,6 +159,10 @@ BUDGET=1 bundle exec rake bench
 gem build --strict sadr.gemspec
 ```
 
+## Contributing
+
+Bug reports and pull requests are welcome at https://github.com/noxdea/sadr.
+
 ## License
 
-Sadr is available under the MIT License.
+Sadr is available under the [MIT License](LICENSE.txt).
