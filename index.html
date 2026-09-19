@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#060a13">
+  <meta name="description" content="Sadr is a pure Ruby Language Server Protocol client.">
+  <title>Sadr — A Language Server Protocol client for Ruby</title>
+  <link rel="stylesheet" href="site.css">
+</head>
+<body style="--accent:#a8d47a">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="#"><span class="star-mark"></span>Sadr</a>
+    <nav aria-label="Primary navigation"><a href="#features">Capabilities</a><a href="#install">Install</a><a href="https://github.com/noxdea/sadr">GitHub</a></nav>
+  </header>
+  <main id="main">
+    <section class="hero">
+      <div>
+        <p class="constellation">γ Cygni · language intelligence</p>
+        <h1>Speak server fluently.</h1>
+        <p class="lede">A pure Ruby LSP client for server lifecycle, document synchronization, diagnostics, semantic tokens, navigation, and workspace edits.</p>
+        <div class="actions"><a class="button primary" href="#install">Install Sadr</a><a class="button" href="https://github.com/noxdea/sadr">View source</a></div>
+        <ul class="facts"><li><strong>JSON-RPC + LSP</strong></li><li>Ruby ≥ 3.1</li><li>MIT licensed</li></ul>
+      </div>
+      <div class="instrument" aria-label="Language server message flow example">
+        <div class="instrument-head"><span>ruby-lsp / example.rb</span><span class="signal">ready</span></div>
+        <div class="instrument-body">
+          <div class="diagram">
+            <span class="orbit" aria-hidden="true"></span>
+            <div class="node nw"><strong>Document</strong>version 4<br>UTF-16 position</div>
+            <div class="node ne"><strong>Diagnostics</strong>2 published<br>0 errors</div>
+            <div class="node core"><strong>Sadr client</strong>epoch 1<br>42 pending</div>
+            <div class="node sw"><strong>Completion</strong>18 items<br>validated</div>
+            <div class="node se"><strong>Semantic</strong>delta applied<br>1,204 tokens</div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="features" id="features">
+      <div class="section-heading"><h2>Own the protocol edge.</h2><p>Sadr validates what crosses the client boundary and leaves buffers, text storage, and interface policy with the host application.</p></div>
+      <div class="feature-grid">
+        <article><h3>Broad coverage</h3><p>Completion, navigation, hierarchy, formatting, rename, links, diagnostics, and semantic tokens.</p></article>
+        <article><h3>Precise positions</h3><p>Convert byte offsets and UTF-16 positions through any caller-owned compatible text index.</p></article>
+        <article><h3>Resilient sessions</h3><p>Cancellable futures, strict response validation, lifecycle control, and automatic server recovery.</p></article>
+      </div>
+    </section>
+    <section class="install" id="install">
+      <div class="install-copy"><h2>Start the server.</h2><p>Open a document and request language intelligence with ordinary Ruby objects.</p></div>
+      <div class="terminal"><div class="terminal-bar">Ruby</div><pre><span class="prompt">$</span> bundle add sadr
+
+client = Sadr::Client.new(
+  command: ["ruby-lsp"]
+)
+client.start
+client.open(document)
+client.completion(document.uri, position).await</pre></div>
+    </section>
+  </main>
+  <footer><p>Sadr · Pure Ruby · MIT</p><div><a href="https://rubygems.org/gems/sadr">RubyGems</a><a href="https://github.com/noxdea/sadr">GitHub</a></div></footer>
+</body>
+</html>
